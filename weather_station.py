@@ -383,7 +383,23 @@ def del_data():
         writer.writerow(["Timestamp", "CPU Temperature (°C)", "CPU Usage (%)", "Memory Usage (%)"])
     print("Local data cleared to save space.\n")
 
-
+def initialize_light_sensor(i2c):
+    """Initialize BH1750 with address auto-detection"""
+    possible_addresses = [0x23, 0x5C]
+    
+    # Scan I2C bus to detect actual devices
+    available_addresses = i2c.scan()
+    
+    # Try known BH1750 addresses in order of preference
+    for addr in possible_addresses:
+        if addr in available_addresses:
+            try:
+                return adafruit_bh1750.BH1750(i2c, address=addr)
+            except Exception as e:
+                print(f"Failed to initialize BH1750 at address 0x{addr:02x}: {e}")
+    
+    # No valid sensor found
+    raise ValueError("BH1750 light sensor not detected at any known address")
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -391,7 +407,7 @@ sys.stdout.reconfigure(line_buffering=True)
 bmp_sensor = BMP085.BMP085()
 dht_sensor = adafruit_dht.DHT11(board.D4)
 i2c = busio.I2C(board.SCL, board.SDA)
-light_sensor = adafruit_bh1750.BH1750(i2c)
+light_sensor = initialize_light_sensor(i2c)
 
 # File paths
 system_csv_file = "/home/njm/system_usage.csv"
