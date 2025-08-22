@@ -62,6 +62,22 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
             cpu_temp = get_cpu_temp()
             cpu_usage = get_cpu_usage()
             memory_usage = get_memory_usage()
+
+            bmp_temps.append(temperature_bmp)
+            pressures.append(pressure)
+            altitudes.append(altitude)
+            if temperature_dht is not None:
+                dht_temps.append(temperature_dht)
+            else:
+                print("DHT temperature read failed")
+            if humidity is not None:
+                humidities.append(humidity)
+            else:
+                print("DHT humidity read failed")
+            light_levels.append(light_level)
+            cpu_temps.append(cpu_temp)
+            cpu_usages.append(cpu_usage)
+            memory_usages.append(memory_usage)
         except Exception as e:
             print(f"Error reading sensor: {e}")
             # A short delay before retrying
