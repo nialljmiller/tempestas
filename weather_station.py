@@ -15,8 +15,8 @@ import psutil  # For CPU and memory usage
 from picamera2 import Picamera2
 
 # Global flag to prevent repeated DHT error messages
-dht_error_logged = False
 global dht_error_logged
+dht_error_logged = False
 
 
 
