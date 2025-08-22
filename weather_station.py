@@ -16,6 +16,7 @@ from picamera2 import Picamera2
 
 # Global flag to prevent repeated DHT error messages
 dht_error_logged = False
+global dht_error_logged
 
 
 
@@ -81,7 +82,6 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
             temperature_dht = dht_sensor.temperature
             humidity = dht_sensor.humidity
         except Exception as e:
-            global dht_error_logged
             if not dht_error_logged:
                 print(f"DHT read error: {e}")
                 dht_error_logged = True
