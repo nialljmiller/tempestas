@@ -52,6 +52,10 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
     end_time = time.time() + sample_duration
     dht_error_logged = False
     while time.time() < end_time:
+        # Ensure DHT variables exist even if the sensor read fails
+        temperature_dht = None
+        humidity = None
+
         try:
             # Gather readings from sensors that are working
             temperature_bmp = bmp_sensor.read_temperature()
@@ -78,7 +82,7 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
             cpu_temps.append(cpu_temp)
             cpu_usages.append(cpu_usage)
             memory_usages.append(memory_usage)
-        except Exception as e:
+
             print(f"Error reading sensor: {e}")
             # A short delay before retrying
             time.sleep(sample_interval)
@@ -92,6 +96,7 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
             if not dht_error_logged:
                 print(f"DHT read error: {e}")
                 dht_error_logged = True
+
             temperature_dht = None
             humidity = None
 
@@ -182,11 +187,15 @@ def makedata():
     memory_usage = get_memory_usage()
 
     # Attempt to read the DHT sensor without aborting if it fails
+    temperature_dht = None
+    humidity = None
+
     try:
         temperature_dht = dht_sensor.temperature
         humidity = dht_sensor.humidity
     except Exception as e:
         print(f"DHT read error: {e}")
+
         temperature_dht = None
         humidity = None
 
