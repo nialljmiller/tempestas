@@ -14,6 +14,9 @@ import sys
 import psutil  # For CPU and memory usage
 from picamera2 import Picamera2
 
+# Global flag to prevent repeated DHT error messages
+dht_error_logged = False
+
 
 
 def get_cpu_temp():
@@ -35,8 +38,9 @@ def get_memory_usage():
     return memory.percent
 
 def makedata_time(sample_duration = 10, sample_interval = 1):
+    global dht_error_logged
     # Set the collection duration and interval (in seconds)
-    
+
     # Prepare lists to store readings
     bmp_temps = []
     pressures = []
@@ -66,27 +70,39 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
             cpu_temp = get_cpu_temp()
             cpu_usage = get_cpu_usage()
             memory_usage = get_memory_usage()
-
-            bmp_temps.append(temperature_bmp)
-            pressures.append(pressure)
-            altitudes.append(altitude)
-            if temperature_dht is not None:
-                dht_temps.append(temperature_dht)
-            else:
-                print("DHT temperature read failed")
-            if humidity is not None:
-                humidities.append(humidity)
-            else:
-                print("DHT humidity read failed")
-            light_levels.append(light_level)
-            cpu_temps.append(cpu_temp)
-            cpu_usages.append(cpu_usage)
-            memory_usages.append(memory_usage)
-
+        except Exception as e:
             print(f"Error reading sensor: {e}")
             # A short delay before retrying
             time.sleep(sample_interval)
             continue
+
+        # DHT sensor readings handled separately to avoid skipping other data
+        try:
+            temperature_dht = dht_sensor.temperature
+            humidity = dht_sensor.humidity
+        except Exception as e:
+            global dht_error_logged
+            if not dht_error_logged:
+                print(f"DHT read error: {e}")
+                dht_error_logged = True
+
+        # Append readings to respective lists, skipping missing values
+        bmp_temps.append(temperature_bmp)
+        pressures.append(pressure)
+        altitudes.append(altitude)
+        if temperature_dht is not None:
+            dht_temps.append(temperature_dht)
+        if humidity is not None:
+            humidities.append(humidity)
+        if light_level is not None:
+
+            light_levels.append(light_level)
+        if isinstance(cpu_temp, (int, float)):
+            cpu_temps.append(cpu_temp)
+        if cpu_usage is not None:
+            cpu_usages.append(cpu_usage)
+        if memory_usage is not None:
+            memory_usages.append(memory_usage)
 
         # DHT sensor readings handled separately to avoid skipping other data
         try:
@@ -173,6 +189,7 @@ light_level = None
 
 def makedata():
     global light_level  # Declare it as global to modify its value inside the function
+    global dht_error_logged
     # Gather data
     timestamp = datetime.now()
     # Create a filesystem-safe timestamp string for the image filename
@@ -194,10 +211,9 @@ def makedata():
         temperature_dht = dht_sensor.temperature
         humidity = dht_sensor.humidity
     except Exception as e:
-        print(f"DHT read error: {e}")
-
-        temperature_dht = None
-        humidity = None
+        if not dht_error_logged:
+            print(f"DHT read error: {e}")
+            dht_error_logged = True
 
 
     # Log data locally
