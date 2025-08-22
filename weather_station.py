@@ -54,6 +54,7 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
 
     # Collect data for sample_duration seconds
     end_time = time.time() + sample_duration
+    dht_error_logged = False
     while time.time() < end_time:
         # Ensure DHT variables exist even if the sensor read fails
         temperature_dht = None
@@ -94,6 +95,7 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
         if humidity is not None:
             humidities.append(humidity)
         if light_level is not None:
+
             light_levels.append(light_level)
         if isinstance(cpu_temp, (int, float)):
             cpu_temps.append(cpu_temp)
@@ -101,6 +103,31 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
             cpu_usages.append(cpu_usage)
         if memory_usage is not None:
             memory_usages.append(memory_usage)
+
+        # DHT sensor readings handled separately to avoid skipping other data
+        try:
+            temperature_dht = dht_sensor.temperature
+            humidity = dht_sensor.humidity
+        except Exception as e:
+            if not dht_error_logged:
+                print(f"DHT read error: {e}")
+                dht_error_logged = True
+
+            temperature_dht = None
+            humidity = None
+
+        # Append readings to respective lists
+        bmp_temps.append(temperature_bmp)
+        pressures.append(pressure)
+        altitudes.append(altitude)
+        if temperature_dht is not None:
+            dht_temps.append(temperature_dht)
+        if humidity is not None:
+            humidities.append(humidity)
+        light_levels.append(light_level)
+        cpu_temps.append(cpu_temp)
+        cpu_usages.append(cpu_usage)
+        memory_usages.append(memory_usage)
 
         time.sleep(sample_interval)
 
@@ -179,6 +206,7 @@ def makedata():
     # Attempt to read the DHT sensor without aborting if it fails
     temperature_dht = None
     humidity = None
+
     try:
         temperature_dht = dht_sensor.temperature
         humidity = dht_sensor.humidity
