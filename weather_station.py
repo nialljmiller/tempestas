@@ -50,52 +50,66 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
 
     # Collect data for sample_duration seconds
     end_time = time.time() + sample_duration
+    dht_error_logged = False
     while time.time() < end_time:
+        # Ensure DHT variables exist even if the sensor read fails
+        temperature_dht = None
+        humidity = None
+
         try:
-            # Gather individual sensor readings
+            # Gather readings from sensors that are working
             temperature_bmp = bmp_sensor.read_temperature()
             pressure = bmp_sensor.read_pressure() / 100  # hPa
             altitude = bmp_sensor.read_altitude()
-            temperature_dht = dht_sensor.temperature
-            humidity = dht_sensor.humidity
             light_level = light_sensor.lux
 
             cpu_temp = get_cpu_temp()
             cpu_usage = get_cpu_usage()
             memory_usage = get_memory_usage()
-
-            # Append readings to respective lists
-            bmp_temps.append(temperature_bmp)
-            pressures.append(pressure)
-            altitudes.append(altitude)
-            dht_temps.append(temperature_dht)
-            humidities.append(humidity)
-            light_levels.append(light_level)
-            cpu_temps.append(cpu_temp)
-            cpu_usages.append(cpu_usage)
-            memory_usages.append(memory_usage)
         except Exception as e:
             print(f"Error reading sensor: {e}")
             # A short delay before retrying
             time.sleep(sample_interval)
             continue
 
+        # DHT sensor readings handled separately to avoid skipping other data
+        try:
+            temperature_dht = dht_sensor.temperature
+            humidity = dht_sensor.humidity
+        except Exception as e:
+            if not dht_error_logged:
+                print(f"DHT read error: {e}")
+                dht_error_logged = True
+
+        # Append readings to respective lists
+        bmp_temps.append(temperature_bmp)
+        pressures.append(pressure)
+        altitudes.append(altitude)
+        if temperature_dht is not None:
+            dht_temps.append(temperature_dht)
+        if humidity is not None:
+            humidities.append(humidity)
+        light_levels.append(light_level)
+        cpu_temps.append(cpu_temp)
+        cpu_usages.append(cpu_usage)
+        memory_usages.append(memory_usage)
+
         time.sleep(sample_interval)
 
     # Compute median values for each sensor reading using numpy
-    if bmp_temps:
-        median_temperature_bmp = np.median(bmp_temps)
-        median_pressure = np.median(pressures)
-        median_altitude = np.median(altitudes)
-        median_temperature_dht = np.median(dht_temps)
-        median_humidity = np.median(humidities)
-        median_light_level = np.median(light_levels)
-        median_cpu_temp = np.median(cpu_temps)
-        median_cpu_usage = np.median(cpu_usages)
-        median_memory_usage = np.median(memory_usages)
-    else:
+    if not bmp_temps and not dht_temps and not light_levels and not cpu_temps:
         print("No samples collected!")
         return None
+
+    median_temperature_bmp = np.median(bmp_temps) if bmp_temps else None
+    median_pressure = np.median(pressures) if pressures else None
+    median_altitude = np.median(altitudes) if altitudes else None
+    median_temperature_dht = np.median(dht_temps) if dht_temps else None
+    median_humidity = np.median(humidities) if humidities else None
+    median_light_level = np.median(light_levels) if light_levels else None
+    median_cpu_temp = np.median(cpu_temps) if cpu_temps else None
+    median_cpu_usage = np.median(cpu_usages) if cpu_usages else None
+    median_memory_usage = np.median(memory_usages) if memory_usages else None
 
     # Use the current time as the timestamp for the median data set
     timestamp = datetime.now()
@@ -114,12 +128,21 @@ def makedata_time(sample_duration = 10, sample_interval = 1):
 
     print("\n\t-----------------------------------------")
     print(f"\tData logged at {timestamp}")
-    print(f"\tMedian BMP Temperature: {median_temperature_bmp:.2f} °C, Pressure: {median_pressure:.2f} hPa, Altitude: {median_altitude:.2f} m")
-    print(f"\tMedian DHT Temperature: {median_temperature_dht:.2f} °C, Humidity: {median_humidity:.2f} %")
-    print(f"\tMedian BH1750 Light: {median_light_level:.2f} lx")
-    print(f"\tMedian CPU Temperature: {median_cpu_temp}°C")
-    print(f"\tMedian CPU Usage: {median_cpu_usage}%")
-    print(f"\tMedian Memory Usage: {median_memory_usage}%")
+    bmp_temp_display = f"{median_temperature_bmp:.2f} °C" if median_temperature_bmp is not None else "N/A"
+    pressure_display = f"{median_pressure:.2f} hPa" if median_pressure is not None else "N/A"
+    altitude_display = f"{median_altitude:.2f} m" if median_altitude is not None else "N/A"
+    print(f"\tMedian BMP Temperature: {bmp_temp_display}, Pressure: {pressure_display}, Altitude: {altitude_display}")
+    dht_temp_display = f"{median_temperature_dht:.2f} °C" if median_temperature_dht is not None else "N/A"
+    humidity_display = f"{median_humidity:.2f} %" if median_humidity is not None else "N/A"
+    print(f"\tMedian DHT Temperature: {dht_temp_display}, Humidity: {humidity_display}")
+    light_display = f"{median_light_level:.2f} lx" if median_light_level is not None else "N/A"
+    print(f"\tMedian BH1750 Light: {light_display}")
+    cpu_temp_display = f"{median_cpu_temp}°C" if median_cpu_temp is not None else "N/A"
+    print(f"\tMedian CPU Temperature: {cpu_temp_display}")
+    cpu_usage_display = f"{median_cpu_usage}%" if median_cpu_usage is not None else "N/A"
+    memory_usage_display = f"{median_memory_usage}%" if median_memory_usage is not None else "N/A"
+    print(f"\tMedian CPU Usage: {cpu_usage_display}")
+    print(f"\tMedian Memory Usage: {memory_usage_display}")
     print(f"\tSamples made: {len(humidities)}")
     print("\t-----------------------------------------\n")
     return 
@@ -138,13 +161,20 @@ def makedata():
     temperature_bmp = bmp_sensor.read_temperature()
     pressure = bmp_sensor.read_pressure() / 100  # Convert to hPa
     altitude = bmp_sensor.read_altitude()
-    temperature_dht = dht_sensor.temperature
-    humidity = dht_sensor.humidity
     light_level = light_sensor.lux
 
     cpu_temp = get_cpu_temp()
     cpu_usage = get_cpu_usage()
     memory_usage = get_memory_usage()
+
+    # Attempt to read the DHT sensor without aborting if it fails
+    temperature_dht = None
+    humidity = None
+    try:
+        temperature_dht = dht_sensor.temperature
+        humidity = dht_sensor.humidity
+    except Exception as e:
+        print(f"DHT read error: {e}")
 
 
     # Log data locally
@@ -161,8 +191,11 @@ def makedata():
     print("\n\t-----------------------------------------")
     print(f"\tData logged at {timestamp}")
     print(f"\tBMP Temperature: {temperature_bmp:.2f} °C, Pressure: {pressure:.2f} hPa, Altitude: {altitude:.2f} m")
-    print(f"\tDHT Temperature: {temperature_dht:.2f} °C, Humidity: {humidity:.2f} %")
-    print(f"\tBH1750 Light: {light_level:.2f} lx")
+    dht_temp_display = f"{temperature_dht:.2f} °C" if temperature_dht is not None else "N/A"
+    humidity_display = f"{humidity:.2f} %" if humidity is not None else "N/A"
+    print(f"\tDHT Temperature: {dht_temp_display}, Humidity: {humidity_display}")
+    light_display = f"{light_level:.2f} lx" if light_level is not None else "N/A"
+    print(f"\tBH1750 Light: {light_display}")
     print(f"\tCPU Temperature: {cpu_temp}°C")
     print(f"\tCPU Usage: {cpu_usage}%")
     print(f"\tMemory Usage: {memory_usage}%")
