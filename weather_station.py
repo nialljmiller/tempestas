@@ -108,19 +108,22 @@ def get_memory_usage():
 def scp_with_retries(local_path, remote_spec):
     for attempt in range(1, SCP_MAX_RETRIES + 1):
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [
                     "scp", "-v",
                     "-l", SCP_BANDWIDTH_LIMIT_KBPS,
                     "-o", f"ConnectTimeout={SCP_CONNECT_TIMEOUT_S}",
                     local_path, remote_spec
                 ],
-                check=True
+                check=True,
+                capture_output=True,
+                text=True
             )
             print(f"✓ Copied: {local_path} -> {remote_spec}")
             return True
         except subprocess.CalledProcessError as e:
             print(f"✗ SCP error (attempt {attempt}): {e}")
+            print(f"  stderr: {e.stderr}")
             if attempt < SCP_MAX_RETRIES:
                 time.sleep(5)
     return False
