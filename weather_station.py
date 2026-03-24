@@ -465,9 +465,9 @@ def main():
                 send_data()
                 write_timer = now
 
-            if (now - del_timer) >= DELETE_BLOCK_SECONDS:
-                del_data()
-                del_timer = now
+                if (now - del_timer) >= DELETE_BLOCK_SECONDS:
+                    del_data()
+                    del_timer = now
 
             # two median blocks per loop, as in your original flow
             makedata_time(sample_duration=MEDIAN_SAMPLES_DURATION, sample_interval=MEDIAN_SAMPLES_INTERVAL)
