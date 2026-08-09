@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 import psutil
 
@@ -650,7 +650,8 @@ def write_data_block(dht_samples, pressure_sensor, camera_manager):
     )
 
     camera_lux, camera_lux_age = camera_manager.lux_with_age()
-    timestamp = datetime.now().isoformat(timespec="seconds")
+    # Store measurement timestamps as explicit UTC.
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     weather_ok = append_csv_row(
         LOCAL_WEATHER_CSV,
