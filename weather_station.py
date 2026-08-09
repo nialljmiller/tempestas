@@ -143,9 +143,13 @@ CAMERA_NIGHT_PROFILES = (
 CAMERA_IR_CUT_COMPENSATION = True
 CAMERA_IR_COLOUR_MATRIX = (
     0.55, 0.05, 0.00, 0.0,
-    0.25, 1.15, 0.00, 0.0,
+    0.00, 1.45, 0.00, 0.0,
     0.00, 0.05, 0.70, 0.0,
 )
+# The failed IR-cut filter makes some foliage/highlights carry false chroma even
+# after channel balancing.  Blend the corrected DAY image slightly toward
+# grayscale so that residual IR colour does not become neon green/magenta.
+CAMERA_DAY_POST_SATURATION = 0.75
 CAMERA_ROTATE_180 = True
 CAMERA_JPEG_QUALITY = 95
 
@@ -1027,6 +1031,11 @@ class CameraManager:
 
                 if needs_colour:
                     image = image.convert("RGB", CAMERA_IR_COLOUR_MATRIX)
+                    if CAMERA_DAY_POST_SATURATION < 1.0:
+                        grayscale = image.convert("L").convert("RGB")
+                        image = Image.blend(
+                            grayscale, image, CAMERA_DAY_POST_SATURATION
+                        )
 
                 image.save(
                     temp_path,
@@ -1041,7 +1050,7 @@ class CameraManager:
             os.replace(temp_path, image_path)
             actions = []
             if needs_colour:
-                actions.append("IR-cut daylight colour compensation")
+                actions.append("IR-cut daylight colour compensation + false-colour suppression")
             if mode == "twilight":
                 actions.append("twilight low-saturation profile")
             if mode == "night":
