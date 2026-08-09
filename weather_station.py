@@ -44,11 +44,21 @@ else:
 
 try:
     from picamera2 import Picamera2
+    import libcamera
 except Exception as exc:
     Picamera2 = None
+    libcamera = None
     CAMERA_IMPORT_ERROR = exc
 else:
     CAMERA_IMPORT_ERROR = None
+
+try:
+    from PIL import Image
+except Exception as exc:
+    Image = None
+    PIL_IMPORT_ERROR = exc
+else:
+    PIL_IMPORT_ERROR = None
 
 
 # -----------------------------------------------------------------------------
@@ -80,16 +90,68 @@ UPLOAD_INTERVAL_S = 300.0
 # a positive number only if you explicitly want confirmed-upload cleanup.
 LOCAL_CSV_CLEAR_INTERVAL_S = None
 
-LOW_LIGHT_LUX = 100.0
-CAMERA_STABLE_THRESHOLD = 0.02
-CAMERA_REQUIRED_STABLE_ITERATIONS = 3
-CAMERA_MAX_STABILIZATION_ITERATIONS = 30
-CAMERA_STABILIZATION_SLEEP_S = 0.5
+# Camera scene classification uses hysteresis so dusk/dawn does not cause the
+# camera to flap between profiles every five minutes.  Lux is the primary
+# signal; metered ExposureTime * AnalogueGain is used if Lux is unavailable.
+CAMERA_DAY_ENTER_LUX = 35.0
+CAMERA_DAY_EXIT_LUX = 20.0
+CAMERA_NIGHT_ENTER_LUX = 4.0
+CAMERA_NIGHT_EXIT_LUX = 8.0
 
-MAX_IMAGE_FILES = 100
+# Auto-metering is performed at the start of every capture.  Picamera2 reports
+# exposure/gain/lux in metadata for completed frames, so no image array needs to
+# be copied merely to let AE/AWB settle.
+CAMERA_METER_MAX_FRAMES = 10
+CAMERA_METER_REQUIRED_STABLE = 2
+CAMERA_STABLE_THRESHOLD = 0.03
+
+# Day profile: retain normal colour capture and correct the failed IR-cut filter
+# afterwards.  Twilight deliberately desaturates because near-IR increasingly
+# dominates and true colour becomes unreliable.
+CAMERA_DAY_SATURATION = 1.0
+CAMERA_TWILIGHT_SATURATION = 0.20
+CAMERA_TWILIGHT_EXPOSURE_VALUE = 0.5
+
+# Night profile: fixed manual exposure/gain, monochrome, and frame stacking.
+# The target is chosen from the auto-metered scene brightness, then clamped to
+# whatever ranges this particular camera mode advertises at runtime.
+CAMERA_NIGHT_MAX_EXPOSURE_US = 4_000_000
+CAMERA_NIGHT_MAX_ANALOGUE_GAIN = 12.0
+CAMERA_NIGHT_FRAME_MARGIN_US = 100_000
+CAMERA_NIGHT_MANUAL_SETTLE_FRAMES = 3
+CAMERA_NIGHT_STACK_SHORT = 4     # exposure <= 1 s
+CAMERA_NIGHT_STACK_LONG = 3      # exposure > 1 s
+CAMERA_NIGHT_SHORT_EXPOSURE_US = 1_000_000
+
+# (minimum metered lux, target exposure microseconds, target analogue gain)
+CAMERA_NIGHT_PROFILES = (
+    (2.0, 150_000, 3.0),
+    (1.0, 350_000, 4.0),
+    (0.2, 800_000, 6.0),
+    (0.05, 1_500_000, 8.0),
+    (-math.inf, 3_000_000, 10.0),
+)
+
+# The camera's IR-cut filter has failed, producing a strong magenta cast in
+# daylight.  This 3x3 RGB correction matrix was tuned against a representative
+# image from this specific camera.  It is used only in DAY mode.
+#
+# PIL's RGB conversion matrix is:
+#   R' = aR + bG + cB + d
+#   G' = eR + fG + gB + h
+#   B' = iR + jG + kB + l
+CAMERA_IR_CUT_COMPENSATION = True
+CAMERA_IR_COLOUR_MATRIX = (
+    0.55, 0.05, 0.00, 0.0,
+    0.25, 1.15, 0.00, 0.0,
+    0.00, 0.05, 0.70, 0.0,
+)
+CAMERA_ROTATE_180 = True
+CAMERA_JPEG_QUALITY = 95
+
 SCP_MAX_RETRIES = 3
 SCP_RETRY_DELAY_S = 5.0
-SCP_BANDWIDTH_LIMIT_KBPS = "500"
+SCP_BANDWIDTH_LIMIT_KBIT_S = "500"
 SCP_CONNECT_TIMEOUT_S = "10"
 SCP_PROCESS_TIMEOUT_S = 180
 
@@ -471,10 +533,25 @@ def combine_ambient_temperatures(dht_temperature_c, pressure_temperature_c):
 # -----------------------------------------------------------------------------
 
 class CameraManager:
+    """Fault-tolerant day/twilight/night camera controller.
+
+    Capture flow:
+      1. Start in AE/AWB mode and meter the scene.
+      2. Select DAY / TWILIGHT / NIGHT with hysteresis.
+      3. DAY: normal colour + failed-IR-cut correction in post-processing.
+      4. TWILIGHT: AE/AWB + low saturation; no fake colour reconstruction.
+      5. NIGHT: restart with manual long exposure/high gain, monochrome,
+         high-quality noise reduction where supported, and average 3-4 frames.
+      6. Rotate every final image by 180 degrees.
+
+    Every failure is contained so camera trouble cannot stop weather telemetry.
+    """
+
     def __init__(self):
         self.camera = None
         self.last_lux = math.nan
         self.last_lux_monotonic = None
+        self.scene_mode = None
         self.initialize()
 
     @property
@@ -490,8 +567,21 @@ class CameraManager:
 
         try:
             self.camera = Picamera2()
-            self.camera.configure(self.camera.create_still_configuration())
-            log("Camera initialized")
+            # Apply the 180-degree orientation in libcamera itself. This rotates
+            # all delivered frames before JPEG encoding, so orientation remains
+            # correct even if Pillow/post-processing is unavailable.
+            transform = (
+                libcamera.Transform(hflip=True, vflip=True)
+                if CAMERA_ROTATE_180
+                else libcamera.Transform()
+            )
+            configuration = self.camera.create_still_configuration(transform=transform)
+            self.camera.configure(configuration)
+            log(
+                "Camera initialized"
+                + (" with 180-degree camera transform" if CAMERA_ROTATE_180 else "")
+            )
+            self._log_control_ranges()
             return True
         except Exception as exc:
             self.camera = None
@@ -501,10 +591,26 @@ class CameraManager:
     def close(self):
         if self.camera is not None:
             try:
+                if getattr(self.camera, "started", False):
+                    self.camera.stop()
+            except Exception as exc:
+                log(f"Camera stop during cleanup warning: {exc}", "WARNING")
+            try:
                 self.camera.close()
             except Exception as exc:
                 log(f"Camera cleanup warning: {exc}", "WARNING")
         self.camera = None
+
+    def _log_control_ranges(self):
+        if self.camera is None:
+            return
+        for name in ("ExposureTime", "AnalogueGain", "FrameDurationLimits"):
+            try:
+                info = self.camera.camera_controls.get(name)
+            except Exception:
+                info = None
+            if info is not None:
+                log(f"Camera control {name} range/default: {info}")
 
     def lux_with_age(self):
         if not is_finite(self.last_lux) or self.last_lux_monotonic is None:
@@ -526,14 +632,438 @@ class CameraManager:
 
             compared += 1
             relative_change = abs(current_value - previous_value) / abs(previous_value)
-            log(f"Camera {key}: {current_value} (relative change {relative_change:.4f})")
             if relative_change > threshold:
                 return False
 
         return compared > 0
 
+    @staticmethod
+    def _hq_noise_reduction_value():
+        """Return the libcamera HQ denoise enum across common API spellings."""
+        if libcamera is None:
+            return None
+        try:
+            enum = libcamera.controls.draft.NoiseReductionModeEnum
+        except Exception:
+            return None
+        for attr in ("HighQuality", "NoiseReductionModeHighQuality"):
+            if hasattr(enum, attr):
+                return getattr(enum, attr)
+        return None
+
+    def _supported_controls(self, requested):
+        """Drop controls not advertised by this camera/libcamera combination."""
+        if self.camera is None:
+            return {}
+        try:
+            available = self.camera.camera_controls
+        except Exception:
+            available = {}
+
+        result = {}
+        for name, value in requested.items():
+            if value is None:
+                continue
+            if name in available:
+                result[name] = value
+            else:
+                log(f"Camera control {name} not supported; skipping", "WARNING")
+        return result
+
+    def _set_controls(self, requested, context):
+        controls = self._supported_controls(requested)
+        if not controls:
+            return True
+        try:
+            self.camera.set_controls(controls)
+            log(f"Camera controls applied for {context}: {controls}")
+            return True
+        except Exception as exc:
+            log(f"Camera controls failed for {context}: {exc}", "ERROR")
+            return False
+
+    def _auto_meter_controls(self):
+        return {
+            "AeEnable": True,
+            "AwbEnable": True,
+            "Saturation": CAMERA_DAY_SATURATION,
+            "Contrast": 1.0,
+            "Sharpness": 1.1,
+            "ExposureValue": 0.0,
+            "NoiseReductionMode": self._hq_noise_reduction_value(),
+        }
+
+    def _twilight_controls(self):
+        return {
+            "AeEnable": True,
+            "AwbEnable": True,
+            "Saturation": CAMERA_TWILIGHT_SATURATION,
+            "Contrast": 1.1,
+            "Sharpness": 1.2,
+            "ExposureValue": CAMERA_TWILIGHT_EXPOSURE_VALUE,
+            "NoiseReductionMode": self._hq_noise_reduction_value(),
+        }
+
+    def _meter_scene(self):
+        """Wait for AE/AGC to settle enough to classify scene brightness."""
+        previous = None
+        stable_count = 0
+        latest = {}
+
+        for frame in range(1, CAMERA_METER_MAX_FRAMES + 1):
+            latest = self.camera.capture_metadata()
+
+            if previous is not None and self._metadata_stable(previous, latest):
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            lux = safe_float(latest.get("Lux"))
+            exposure_us = safe_float(latest.get("ExposureTime"))
+            gain = safe_float(latest.get("AnalogueGain"))
+            log(
+                f"Camera meter frame {frame}: lux={lux:.3f}, "
+                f"exposure={exposure_us:.0f} us, gain={gain:.3f}, "
+                f"stable={stable_count}/{CAMERA_METER_REQUIRED_STABLE}"
+            )
+
+            if stable_count >= CAMERA_METER_REQUIRED_STABLE:
+                break
+            previous = latest
+
+        return latest
+
+    def _classify_scene(self, metadata):
+        lux = safe_float(metadata.get("Lux"))
+        exposure_us = safe_float(metadata.get("ExposureTime"))
+        gain = safe_float(metadata.get("AnalogueGain"))
+
+        if is_finite(lux):
+            previous_mode = self.scene_mode
+
+            if previous_mode == "day":
+                mode = "day" if lux >= CAMERA_DAY_EXIT_LUX else "twilight"
+            elif previous_mode == "night":
+                if lux >= CAMERA_DAY_ENTER_LUX:
+                    mode = "day"
+                elif lux >= CAMERA_NIGHT_EXIT_LUX:
+                    mode = "twilight"
+                else:
+                    mode = "night"
+            elif previous_mode == "twilight":
+                if lux >= CAMERA_DAY_ENTER_LUX:
+                    mode = "day"
+                elif lux <= CAMERA_NIGHT_ENTER_LUX:
+                    mode = "night"
+                else:
+                    mode = "twilight"
+            else:
+                if lux >= CAMERA_DAY_ENTER_LUX:
+                    mode = "day"
+                elif lux <= CAMERA_NIGHT_ENTER_LUX:
+                    mode = "night"
+                else:
+                    mode = "twilight"
+        else:
+            # Fallback if this libcamera/tuning combination does not expose Lux.
+            # ExposureTime*AnalogueGain is only a relative scene-brightness proxy,
+            # but it is much safer than guessing from clock time.
+            if is_finite(exposure_us) and is_finite(gain):
+                exposure_product = exposure_us * gain
+                if exposure_product < 50_000:
+                    mode = "day"
+                elif exposure_product < 400_000:
+                    mode = "twilight"
+                else:
+                    mode = "night"
+                log(
+                    f"Camera Lux unavailable; classified from exposure product "
+                    f"{exposure_product:.0f} us*gain",
+                    "WARNING",
+                )
+            else:
+                mode = self.scene_mode or "twilight"
+                log(
+                    "Camera has neither usable Lux nor exposure/gain metadata; "
+                    f"retaining conservative mode={mode}",
+                    "WARNING",
+                )
+
+        if mode != self.scene_mode:
+            log(f"Camera scene mode transition: {self.scene_mode or 'unset'} -> {mode.upper()}")
+        self.scene_mode = mode
+        return mode
+
+    def _clamp_scalar_control(self, name, value):
+        try:
+            minimum, maximum, _default = self.camera.camera_controls[name]
+            if isinstance(minimum, (int, float)) and isinstance(maximum, (int, float)):
+                return max(float(minimum), min(float(maximum), float(value)))
+        except Exception:
+            pass
+        return float(value)
+
+    def _clamp_frame_duration(self, value_us):
+        value_us = int(value_us)
+        try:
+            minimum, maximum, _default = self.camera.camera_controls["FrameDurationLimits"]
+            if isinstance(minimum, (tuple, list)) and isinstance(maximum, (tuple, list)):
+                lower = max(float(x) for x in minimum)
+                upper = min(float(x) for x in maximum)
+                value_us = int(max(lower, min(upper, value_us)))
+        except Exception:
+            pass
+        return value_us
+
+    def _night_target(self, metadata):
+        lux = safe_float(metadata.get("Lux"))
+        metered_exposure = safe_float(metadata.get("ExposureTime"))
+        metered_gain = safe_float(metadata.get("AnalogueGain"))
+
+        base_exposure = 1_500_000
+        base_gain = 8.0
+        if is_finite(lux):
+            for minimum_lux, exposure_us, gain in CAMERA_NIGHT_PROFILES:
+                if lux >= minimum_lux:
+                    base_exposure = exposure_us
+                    base_gain = gain
+                    break
+
+        # Let the auto-metered values push us longer/higher, but never below the
+        # profile minimum and never beyond the configured quality/noise limits.
+        target_exposure = float(base_exposure)
+        if is_finite(metered_exposure):
+            target_exposure = max(target_exposure, metered_exposure * 2.0)
+        target_exposure = min(target_exposure, CAMERA_NIGHT_MAX_EXPOSURE_US)
+        target_exposure = self._clamp_scalar_control("ExposureTime", target_exposure)
+
+        target_gain = float(base_gain)
+        if is_finite(metered_gain):
+            target_gain = max(target_gain, metered_gain)
+        target_gain = min(target_gain, CAMERA_NIGHT_MAX_ANALOGUE_GAIN)
+        target_gain = self._clamp_scalar_control("AnalogueGain", target_gain)
+
+        exposure_us = int(round(target_exposure))
+        gain = float(target_gain)
+        frame_duration_us = self._clamp_frame_duration(
+            exposure_us + CAMERA_NIGHT_FRAME_MARGIN_US
+        )
+
+        # Exposure cannot exceed the frame duration. Clamp once more if a camera
+        # advertises a tighter frame-duration ceiling than its exposure ceiling.
+        if frame_duration_us < exposure_us:
+            exposure_us = frame_duration_us
+
+        stack_count = (
+            CAMERA_NIGHT_STACK_SHORT
+            if exposure_us <= CAMERA_NIGHT_SHORT_EXPOSURE_US
+            else CAMERA_NIGHT_STACK_LONG
+        )
+
+        return exposure_us, gain, frame_duration_us, stack_count
+
+    def _night_controls(self, exposure_us, gain, frame_duration_us):
+        return {
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ColourGains": (1.0, 1.0),
+            "Saturation": 0.0,
+            "Contrast": 1.15,
+            "Sharpness": 1.2,
+            "ExposureTime": int(exposure_us),
+            "AnalogueGain": float(gain),
+            "FrameDurationLimits": (int(frame_duration_us), int(frame_duration_us)),
+            "NoiseReductionMode": self._hq_noise_reduction_value(),
+        }
+
+    def _wait_for_manual_controls(self, target_exposure_us, target_gain):
+        """Confirm that manual exposure/gain actually reached completed frames."""
+        latest = {}
+        for frame in range(1, CAMERA_NIGHT_MANUAL_SETTLE_FRAMES + 1):
+            latest = self.camera.capture_metadata()
+            exposure = safe_float(latest.get("ExposureTime"))
+            gain = safe_float(latest.get("AnalogueGain"))
+            log(
+                f"Night manual settle frame {frame}: exposure={exposure:.0f} us, "
+                f"gain={gain:.3f}"
+            )
+
+            exposure_ok = (
+                is_finite(exposure)
+                and abs(exposure - target_exposure_us) <= max(5_000, target_exposure_us * 0.10)
+            )
+            gain_ok = (
+                is_finite(gain)
+                and abs(gain - target_gain) <= max(0.25, target_gain * 0.20)
+            )
+            if exposure_ok and gain_ok:
+                return latest
+
+        log(
+            "Manual night exposure/gain did not confirm within settle-frame limit; "
+            "capturing with the latest applied values",
+            "WARNING",
+        )
+        return latest
+
+    @staticmethod
+    def _average_night_frames(frame_paths, output_path):
+        """Average several monochrome JPEGs without a large NumPy allocation."""
+        if Image is None:
+            raise RuntimeError(f"Pillow unavailable: {PIL_IMPORT_ERROR}")
+        if not frame_paths:
+            raise RuntimeError("no night frames supplied for stacking")
+
+        average = None
+        count = 0
+        for path in frame_paths:
+            with Image.open(path) as opened:
+                frame = opened.convert("L")
+                if average is None:
+                    average = frame.copy()
+                    count = 1
+                else:
+                    count += 1
+                    # Running arithmetic mean.  This keeps memory bounded to two
+                    # image buffers and preserves moving animals as blur/ghosts
+                    # rather than deleting them as a median stack might.
+                    average = Image.blend(average, frame, 1.0 / count)
+
+        if average is None:
+            raise RuntimeError("night stack produced no image")
+
+        average.convert("RGB").save(
+            output_path,
+            format="JPEG",
+            quality=CAMERA_JPEG_QUALITY,
+            optimize=True,
+        )
+
+    def _capture_night_stack(self, image_path, stack_count):
+        # Pillow is used only for frame averaging. If it is unavailable, retain
+        # a perfectly valid single manually-exposed frame rather than failing
+        # the whole camera cycle. Rotation has already happened in libcamera.
+        if Image is None:
+            log(
+                f"Pillow unavailable ({PIL_IMPORT_ERROR}); falling back to one "
+                "unstacked night frame",
+                "WARNING",
+            )
+            self.camera.capture_file(image_path)
+            return False
+
+        root, extension = os.path.splitext(image_path)
+        temporary = []
+        try:
+            for index in range(stack_count):
+                frame_path = f"{root}.nightstack_{index:02d}{extension}"
+                self.camera.capture_file(frame_path)
+                if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+                    raise RuntimeError(f"empty night frame: {frame_path}")
+                temporary.append(frame_path)
+                log(
+                    f"Night frame {index + 1}/{stack_count} captured: "
+                    f"{frame_path} ({os.path.getsize(frame_path)} bytes)"
+                )
+
+            self._average_night_frames(temporary, image_path)
+            if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
+                raise RuntimeError("averaged night JPEG is empty")
+            log(f"Averaged {len(temporary)} night frames into {image_path}")
+            return True
+
+        except Exception as exc:
+            # A valid last exposure is more valuable than no image. Preserve the
+            # newest successfully captured frame as the final image if stacking
+            # itself fails for any reason.
+            if temporary:
+                fallback = temporary[-1]
+                try:
+                    os.replace(fallback, image_path)
+                    temporary.pop()
+                    log(
+                        f"Night stacking failed ({exc}); retained final single "
+                        f"exposure as {image_path}",
+                        "WARNING",
+                    )
+                    return False
+                except Exception as fallback_exc:
+                    log(
+                        f"Night stacking failed ({exc}) and fallback frame could "
+                        f"not be preserved: {fallback_exc}",
+                        "ERROR",
+                    )
+            raise
+
+        finally:
+            for path in temporary:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception as exc:
+                    log(f"Could not remove temporary night frame {path}: {exc}", "WARNING")
+
+
+    @staticmethod
+    def _postprocess_image(image_path, mode):
+        """Apply daylight IR colour compensation after camera-side rotation."""
+        needs_colour = CAMERA_IR_CUT_COMPENSATION and mode == "day"
+
+        if not needs_colour:
+            return True
+
+        if Image is None:
+            log(
+                f"Image post-processing unavailable (Pillow import failed: "
+                f"{PIL_IMPORT_ERROR}); retaining unprocessed image",
+                "ERROR",
+            )
+            return False
+
+        temp_path = f"{image_path}.postprocess.tmp"
+        try:
+            with Image.open(image_path) as opened:
+                image = opened.convert("RGB")
+
+                if needs_colour:
+                    image = image.convert("RGB", CAMERA_IR_COLOUR_MATRIX)
+
+                image.save(
+                    temp_path,
+                    format="JPEG",
+                    quality=CAMERA_JPEG_QUALITY,
+                    optimize=True,
+                )
+
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                raise RuntimeError("post-processed JPEG is empty")
+
+            os.replace(temp_path, image_path)
+            actions = []
+            if needs_colour:
+                actions.append("IR-cut daylight colour compensation")
+            if mode == "twilight":
+                actions.append("twilight low-saturation profile")
+            if mode == "night":
+                actions.append("night monochrome stack")
+            log(f"Applied {' + '.join(actions)} to {image_path}")
+            return True
+
+        except Exception as exc:
+            log(
+                f"Image post-processing failed for {image_path}: {exc}; "
+                "retaining original capture",
+                "ERROR",
+            )
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return False
+
     def capture(self):
-        """Capture one image.  Failure is contained and returns None."""
+        """Capture one best-effort day/twilight/night image."""
         if self.camera is None and not self.initialize():
             return None
 
@@ -541,79 +1071,74 @@ class CameraManager:
         started = False
 
         try:
+            # Always meter afresh in full auto first.  This resets any manual
+            # night controls left from the previous five-minute cycle.
+            self._set_controls(self._auto_meter_controls(), "auto metering")
             camera.start()
             started = True
-            camera.set_controls({
-                "AeEnable": True,
-                "AwbEnable": True,
-                "Saturation": 1.0,
-                "Contrast": 1.0,
-                "Sharpness": 1.1,
-            })
 
-            time.sleep(0.5)
-            metadata = camera.capture_metadata()
+            metadata = self._meter_scene()
             lux = safe_float(metadata.get("Lux"))
+            exposure_us = safe_float(metadata.get("ExposureTime"))
+            gain = safe_float(metadata.get("AnalogueGain"))
 
             if is_finite(lux):
                 self.last_lux = lux
                 self.last_lux_monotonic = time.monotonic()
-                log(f"Camera reported {lux:.2f} lux")
             else:
                 log("Camera metadata did not contain a finite Lux value", "WARNING")
 
-            low_light = is_finite(lux) and lux < LOW_LIGHT_LUX
-            if low_light:
-                log("Low light detected; applying low-light camera controls")
-                camera.set_controls({
-                    "AnalogueGain": 9.0,
-                    "Saturation": 0.0,
-                    "Contrast": 1.2,
-                    "Sharpness": 1.5,
-                })
-                time.sleep(0.5)
-
-            # Stabilization is camera-only.  It must never trigger DHT reads.
-            if not low_light:
-                previous = None
-                stable_count = 0
-
-                for iteration in range(1, CAMERA_MAX_STABILIZATION_ITERATIONS + 1):
-                    camera.capture_array("main")
-                    current = camera.capture_metadata()
-
-                    if previous is not None:
-                        if self._metadata_stable(previous, current):
-                            stable_count += 1
-                            log(
-                                f"Camera stability check {stable_count}/"
-                                f"{CAMERA_REQUIRED_STABLE_ITERATIONS}"
-                            )
-                        else:
-                            stable_count = 0
-
-                    previous = current
-
-                    if stable_count >= CAMERA_REQUIRED_STABLE_ITERATIONS:
-                        log("Camera settings stabilized")
-                        break
-
-                    time.sleep(CAMERA_STABILIZATION_SLEEP_S)
-                else:
-                    log(
-                        "Camera did not meet stabilization threshold before limit; "
-                        "capturing anyway",
-                        "WARNING",
-                    )
+            mode = self._classify_scene(metadata)
+            log(
+                f"Camera selected {mode.upper()} profile from meter: "
+                f"lux={lux:.3f}, exposure={exposure_us:.0f} us, gain={gain:.3f}"
+            )
 
             stamp = time.strftime("%Y%m%d_%H%M%S")
             image_path = os.path.join(IMAGE_DIR, f"{stamp}.jpg")
-            camera.capture_file(image_path)
+
+            if mode == "day":
+                # Already in the appropriate auto profile; capture immediately.
+                camera.capture_file(image_path)
+
+            elif mode == "twilight":
+                self._set_controls(self._twilight_controls(), "twilight")
+                # Give changed ISP controls a couple of completed frames.
+                camera.capture_metadata()
+                camera.capture_metadata()
+                camera.capture_file(image_path)
+
+            else:  # NIGHT
+                target_exposure, target_gain, frame_duration, stack_count = self._night_target(metadata)
+                log(
+                    f"Night target: exposure={target_exposure} us "
+                    f"({target_exposure / 1e6:.2f} s), gain={target_gain:.2f}, "
+                    f"frame_duration={frame_duration} us, stack={stack_count}"
+                )
+
+                # Picamera2 documents that controls set after configure but
+                # before start apply to the first frame. Restarting here avoids
+                # several-frame ambiguity for long manual exposures.
+                camera.stop()
+                started = False
+                self._set_controls(
+                    self._night_controls(target_exposure, target_gain, frame_duration),
+                    "night manual",
+                )
+                camera.start()
+                started = True
+                self._wait_for_manual_controls(target_exposure, target_gain)
+                self._capture_night_stack(image_path, stack_count)
 
             if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
                 raise RuntimeError(f"camera produced an empty image: {image_path}")
 
-            log(f"Saved image: {image_path} ({os.path.getsize(image_path)} bytes)")
+            self._postprocess_image(image_path, mode=mode)
+
+            log(
+                f"Saved {mode.upper()} image: {image_path} "
+                f"({os.path.getsize(image_path)} bytes)"
+            )
             return image_path
 
         except Exception as exc:
@@ -626,7 +1151,7 @@ class CameraManager:
         finally:
             if started and self.camera is not None:
                 try:
-                    self.camera.stop()
+                    camera.stop()
                 except Exception as exc:
                     log(f"Camera stop warning: {exc}", "WARNING")
 
@@ -720,7 +1245,7 @@ def scp_with_retries(local_path, remote_spec):
                 [
                     "scp",
                     "-v",  # retained intentionally: diagnostic evidence matters
-                    "-l", SCP_BANDWIDTH_LIMIT_KBPS,
+                    "-l", SCP_BANDWIDTH_LIMIT_KBIT_S,
                     "-o", f"ConnectTimeout={SCP_CONNECT_TIMEOUT_S}",
                     local_path,
                     remote_spec,
@@ -754,39 +1279,17 @@ def scp_with_retries(local_path, remote_spec):
 
 
 def send_data(camera_manager):
-    """Capture a picture and transfer pending images + both CSV files.
+    """Transfer telemetry first, then capture/upload only the current image.
 
-    Returns a pair (weather_csv_uploaded, system_csv_uploaded).  Image failures
-    do not prevent environmental/system data from being transferred.
+    Robustness rule: historical image backlog must never delay weather/system
+    telemetry. Existing older images remain untouched in IMAGE_DIR for explicit
+    manual recovery or archival. Returns (weather_csv_uploaded,
+    system_csv_uploaded).
     """
-    camera_manager.capture()
     log("Beginning transfer phase")
 
-    image_files = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg")))
-    if len(image_files) > MAX_IMAGE_FILES:
-        # Do not delete the older backlog merely because it exceeds the normal
-        # batch size.  Send the newest batch now and leave the rest for a later
-        # recovery/manual decision.
-        log(
-            f"Image backlog contains {len(image_files)} files; sending newest "
-            f"{MAX_IMAGE_FILES} this cycle",
-            "WARNING",
-        )
-        image_files = image_files[-MAX_IMAGE_FILES:]
-
-    if not image_files:
-        log("No images pending transfer")
-
-    for path in image_files:
-        if scp_with_retries(path, f"{SERVER_ADDRESS}:{SERVER_IMAGE_DIR}"):
-            try:
-                os.remove(path)
-                log(f"Removed transferred local image: {path}")
-            except Exception as exc:
-                log(f"Could not remove transferred image {path}: {exc}", "WARNING")
-        else:
-            log(f"Preserving image locally after failed transfer: {path}", "ERROR")
-
+    # Environmental/system telemetry is the primary product. Send it before
+    # doing any camera work so camera delays or image backlog cannot block it.
     weather_ok = scp_with_retries(
         LOCAL_WEATHER_CSV,
         f"{SERVER_ADDRESS}:{SERVER_WEATHER_CSV}",
@@ -797,11 +1300,44 @@ def send_data(camera_manager):
     )
 
     if weather_ok and system_ok:
-        log("Transfer phase complete: both CSV files uploaded")
+        log("Primary telemetry transfer complete: both CSV files uploaded")
     else:
         log(
-            f"Transfer phase incomplete: weather={weather_ok}, system={system_ok}",
+            f"Primary telemetry transfer incomplete: weather={weather_ok}, "
+            f"system={system_ok}",
             "ERROR",
+        )
+
+    # Capture one image for this cycle only. Older images are deliberately not
+    # swept here; they must not turn a five-minute telemetry cycle into a long
+    # backlog-draining job.
+    image_path = camera_manager.capture()
+    if image_path is None:
+        log("No new image available for upload this cycle", "WARNING")
+    else:
+        if scp_with_retries(image_path, f"{SERVER_ADDRESS}:{SERVER_IMAGE_DIR}"):
+            try:
+                os.remove(image_path)
+                log(f"Removed transferred current image: {image_path}")
+            except Exception as exc:
+                log(
+                    f"Current image reached server but local cleanup failed "
+                    f"for {image_path}: {exc}",
+                    "WARNING",
+                )
+        else:
+            log(
+                f"Preserving current image locally after failed transfer: {image_path}",
+                "ERROR",
+            )
+
+    # Make any pre-existing backlog explicit in the log without touching it.
+    backlog = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg")))
+    if backlog:
+        log(
+            f"Historical/local image backlog retained: {len(backlog)} file(s). "
+            "Backlog does not block telemetry; transfer/archive it separately.",
+            "WARNING",
         )
 
     return weather_ok, system_ok
@@ -924,5 +1460,23 @@ def main():
         log("Weather station shutdown complete")
 
 
+def camera_test_once():
+    """Capture one local image using the full day/twilight/night pipeline."""
+    ensure_paths()
+    camera = CameraManager()
+    try:
+        path = camera.capture()
+        if path is None:
+            log("Camera test failed", "ERROR")
+            return 1
+        log(f"Camera test complete: {path}")
+        print(path)
+        return 0
+    finally:
+        camera.close()
+
+
 if __name__ == "__main__":
+    if "--camera-test" in sys.argv:
+        raise SystemExit(camera_test_once())
     main()
