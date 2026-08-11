@@ -143,7 +143,7 @@ CAMERA_NIGHT_PROFILES = (
 CAMERA_IR_CUT_COMPENSATION = True
 CAMERA_IR_COLOUR_MATRIX = (
     0.55, 0.05, 0.00, 0.0,
-    0.00, 1.25, 0.00, 0.0,
+    0.00, 1.05, 0.00, 0.0,
     0.00, 0.05, 0.70, 0.0,
 )
 # The failed IR-cut filter makes some foliage/highlights carry false chroma even
