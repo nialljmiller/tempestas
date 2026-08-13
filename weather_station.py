@@ -3,12 +3,16 @@
 
 Current hardware:
   * DHT22 / AM2302 on GPIO4: temperature + relative humidity
+  * BME680 on I2C address 0x77: temperature + relative humidity + pressure +
+    gas resistance
   * Raspberry Pi camera (Picamera2)
 
-Future hardware:
-  * Optional pressure sensor.  The pressure adapter deliberately has its own
-    temperature channel so both the DHT22 and pressure-sensor temperatures are
-    retained, plus a combined ambient-temperature estimate.
+The DHT22 and BME680 are retained as independent sensors and all raw readings
+are stored.  Combined temperature and humidity are the arithmetic mean of the
+two block-median sensor readings when both are available.  For this evaluation
+phase the DHT22 remains the default Ambient_* source, with BME680 as automatic
+fallback; the Combined_* channels can become the default later if they perform
+well.
 
 Design goals:
   * one failed sensor must not terminate the station
@@ -41,6 +45,14 @@ except Exception as exc:
     DHT_IMPORT_ERROR = exc
 else:
     DHT_IMPORT_ERROR = None
+
+try:
+    import adafruit_bme680
+except Exception as exc:
+    adafruit_bme680 = None
+    BME680_IMPORT_ERROR = exc
+else:
+    BME680_IMPORT_ERROR = None
 
 try:
     from picamera2 import Picamera2
@@ -83,6 +95,17 @@ DHT_PIN = board.D4
 DHT_POLL_INTERVAL_S = 5.0
 DHT_REINITIALIZE_AFTER_FAILURES = 12
 DHT_SAMPLE_BUFFER_SIZE = 24
+
+# BME680: use the address actually detected by i2cdetect on this station.
+# It is sampled at the same conservative cadence as the DHT22 so each 30-second
+# record represents comparable time coverage from both sensors.
+BME680_I2C_ADDRESS = 0x77
+BME680_POLL_INTERVAL_S = 5.0
+BME680_REINITIALIZE_AFTER_FAILURES = 6
+BME680_SAMPLE_BUFFER_SIZE = 24
+# Altitude is derived from pressure, not a direct sensor measurement.  Keep the
+# standard sea-level reference explicit so the stored value is reproducible.
+BME680_SEA_LEVEL_PRESSURE_HPA = 1013.25
 
 DATA_LOG_INTERVAL_S = 30.0
 UPLOAD_INTERVAL_S = 300.0
@@ -159,17 +182,24 @@ SCP_BANDWIDTH_LIMIT_KBIT_S = "500"
 SCP_CONNECT_TIMEOUT_S = "10"
 SCP_PROCESS_TIMEOUT_S = 180
 
-# Warn if two independent ambient-temperature sensors disagree substantially.
+# Warn when the independent sensors disagree substantially.  Warnings do not
+# alter either raw reading or the combined value.
 TEMPERATURE_DISAGREEMENT_WARN_C = 2.0
+HUMIDITY_DISAGREEMENT_WARN_PERCENT = 10.0
 
 WEATHER_HEADER = [
     "Timestamp",
     "Ambient_Temperature_C",
+    "Ambient_Humidity_percent",
+    "Combined_Temperature_C",
+    "Combined_Humidity_percent",
     "DHT22_Temperature_C",
     "DHT22_Humidity_percent",
-    "PressureSensor_Temperature_C",
-    "Pressure_hPa",
-    "Pressure_Altitude_m",
+    "BME680_Temperature_C",
+    "BME680_Humidity_percent",
+    "BME680_Pressure_hPa",
+    "BME680_Gas_Resistance_ohm",
+    "BME680_Altitude_m",
     "Camera_Lux",
     "Camera_Lux_Age_s",
 ]
@@ -461,75 +491,196 @@ class DHT22Reader:
 
 
 # -----------------------------------------------------------------------------
-# Optional future pressure sensor
+# BME680
 # -----------------------------------------------------------------------------
 
-class PressureReading:
-    def __init__(self, temperature_c=math.nan, pressure_hpa=math.nan, altitude_m=math.nan):
-        self.temperature_c = safe_float(temperature_c)
-        self.pressure_hpa = safe_float(pressure_hpa)
-        self.altitude_m = safe_float(altitude_m)
+class BME680Reader:
+    """Fault-tolerant BME680 reader for I2C temperature/RH/pressure/gas."""
 
+    def __init__(self, address=BME680_I2C_ADDRESS):
+        self.address = address
+        self.i2c = None
+        self.sensor = None
+        self.consecutive_failures = 0
+        self.last_attempt_monotonic = None
+        self.last_good = (math.nan, math.nan, math.nan, math.nan, math.nan)
+        self.last_good_monotonic = None
+        self.initialize()
 
-class NullPressureSensor:
-    """Explicit no-hardware adapter; keeps pressure support optional."""
+    @property
+    def available(self):
+        return self.sensor is not None
 
-    name = "none"
-    available = False
+    def initialize(self):
+        self.close()
 
-    def read(self):
-        return PressureReading()
+        if adafruit_bme680 is None:
+            log(f"BME680 library unavailable: {BME680_IMPORT_ERROR}", "ERROR")
+            return False
+
+        try:
+            self.i2c = board.I2C()
+            self.sensor = adafruit_bme680.Adafruit_BME680_I2C(
+                self.i2c,
+                address=self.address,
+            )
+            self.sensor.sea_level_pressure = BME680_SEA_LEVEL_PRESSURE_HPA
+            self.consecutive_failures = 0
+            log(f"BME680 initialized on I2C address 0x{self.address:02x}")
+            return True
+        except Exception as exc:
+            self.sensor = None
+            if self.i2c is not None:
+                try:
+                    self.i2c.deinit()
+                except Exception:
+                    pass
+            self.i2c = None
+            log(f"BME680 initialization failed: {exc}", "ERROR")
+            return False
 
     def close(self):
-        return None
+        self.sensor = None
+        if self.i2c is not None:
+            try:
+                self.i2c.deinit()
+            except Exception as exc:
+                log(f"BME680 I2C cleanup warning: {exc}", "WARNING")
+        self.i2c = None
+
+    @staticmethod
+    def _validate_temperature(value):
+        return value if is_finite(value) and -40.0 <= value <= 85.0 else math.nan
+
+    @staticmethod
+    def _validate_humidity(value):
+        return value if is_finite(value) and 0.0 <= value <= 100.0 else math.nan
+
+    @staticmethod
+    def _validate_pressure(value):
+        return value if is_finite(value) and 300.0 <= value <= 1100.0 else math.nan
+
+    @staticmethod
+    def _validate_gas(value):
+        return value if is_finite(value) and value > 0.0 else math.nan
+
+    def read_once(self):
+        """Perform one BME680 sample; caller controls the cadence."""
+        if self.sensor is None and not self.initialize():
+            return (*self.last_good, False)
+
+        now = time.monotonic()
+        if self.last_attempt_monotonic is not None:
+            elapsed = now - self.last_attempt_monotonic
+            if elapsed < BME680_POLL_INTERVAL_S:
+                log(
+                    f"BME680 read suppressed: only {elapsed:.2f}s since previous attempt",
+                    "WARNING",
+                )
+                return math.nan, math.nan, math.nan, math.nan, math.nan, False
+
+        self.last_attempt_monotonic = now
+
+        try:
+            temperature = self._validate_temperature(safe_float(self.sensor.temperature))
+            humidity = self._validate_humidity(safe_float(self.sensor.relative_humidity))
+            pressure = self._validate_pressure(safe_float(self.sensor.pressure))
+            gas = self._validate_gas(safe_float(self.sensor.gas))
+            altitude = safe_float(self.sensor.altitude)
+            if not is_finite(altitude):
+                altitude = math.nan
+
+            # Temperature, humidity and pressure are the core environmental
+            # channels. Gas resistance is retained even during its burn-in, but
+            # a temporarily invalid gas value does not discard an otherwise good
+            # BME680 sample.
+            if not all(is_finite(v) for v in (temperature, humidity, pressure)):
+                raise RuntimeError(
+                    f"BME680 returned invalid core data: "
+                    f"T={temperature}, RH={humidity}, P={pressure}"
+                )
+
+            self.consecutive_failures = 0
+            self.last_good = (temperature, humidity, pressure, gas, altitude)
+            self.last_good_monotonic = time.monotonic()
+            log(
+                f"BME680 read OK: {temperature:.2f} C, {humidity:.2f} %, "
+                f"{pressure:.2f} hPa, gas={gas:.0f} ohm, altitude={altitude:.2f} m"
+            )
+            return temperature, humidity, pressure, gas, altitude, True
+
+        except Exception as exc:
+            self.consecutive_failures += 1
+            log(
+                f"BME680 read failure ({self.consecutive_failures} consecutive): {exc}",
+                "WARNING",
+            )
+
+        if self.consecutive_failures >= BME680_REINITIALIZE_AFTER_FAILURES:
+            log(
+                f"BME680 has failed {self.consecutive_failures} consecutive reads; "
+                "reinitializing I2C interface",
+                "ERROR",
+            )
+            self.initialize()
+
+        return math.nan, math.nan, math.nan, math.nan, math.nan, False
 
 
-def initialize_pressure_sensor():
-    """Return the configured pressure-sensor adapter.
-
-    There is intentionally no pressure sensor configured today.
-
-    When one is added, put its hardware-specific initialization behind an
-    adapter here.  Its read() method must return PressureReading containing:
-      * temperature_c -- kept separately from DHT22 temperature
-      * pressure_hpa
-      * altitude_m     -- optional; may remain NaN
-
-    The rest of the station does not need to change.  If the future sensor has
-    a temperature channel, both raw temperatures are stored and both feed the
-    Ambient_Temperature_C estimate.
-    """
-    return NullPressureSensor()
-
-
-def read_pressure_sensor(sensor):
-    try:
-        reading = sensor.read()
-        if reading is None:
-            raise RuntimeError("pressure sensor returned None")
-        return reading
-    except Exception as exc:
-        log(f"Pressure-sensor read failed ({getattr(sensor, 'name', 'unknown')}): {exc}", "WARNING")
-        return PressureReading()
-
-
-def combine_ambient_temperatures(dht_temperature_c, pressure_temperature_c):
-    values = [
-        value
-        for value in (dht_temperature_c, pressure_temperature_c)
-        if is_finite(value)
-    ]
+def combine_two_sensor_values(
+    first_value,
+    second_value,
+    *,
+    first_name,
+    second_name,
+    disagreement_threshold,
+    unit,
+):
+    """Return the mean of available sensors, preserving single-sensor fallback."""
+    values = [value for value in (first_value, second_value) if is_finite(value)]
 
     if len(values) == 2:
         difference = abs(values[0] - values[1])
-        if difference > TEMPERATURE_DISAGREEMENT_WARN_C:
+        if difference > disagreement_threshold:
             log(
-                f"Temperature sensors disagree by {difference:.2f} C: "
-                f"DHT22={values[0]:.2f} C, pressure sensor={values[1]:.2f} C",
+                f"{first_name} and {second_name} disagree by {difference:.2f} {unit}: "
+                f"{first_name}={values[0]:.2f} {unit}, "
+                f"{second_name}={values[1]:.2f} {unit}",
                 "WARNING",
             )
 
     return mean_or_nan(values)
+
+
+def combine_ambient_temperatures(dht_temperature_c, bme_temperature_c):
+    return combine_two_sensor_values(
+        dht_temperature_c,
+        bme_temperature_c,
+        first_name="DHT22",
+        second_name="BME680",
+        disagreement_threshold=TEMPERATURE_DISAGREEMENT_WARN_C,
+        unit="C",
+    )
+
+
+def combine_ambient_humidities(dht_humidity_percent, bme_humidity_percent):
+    return combine_two_sensor_values(
+        dht_humidity_percent,
+        bme_humidity_percent,
+        first_name="DHT22",
+        second_name="BME680",
+        disagreement_threshold=HUMIDITY_DISAGREEMENT_WARN_PERCENT,
+        unit="percentage points",
+    )
+
+
+def primary_with_fallback(primary_value, fallback_value):
+    """Retain the current DHT22 default while allowing automatic BME fallback."""
+    if is_finite(primary_value):
+        return float(primary_value)
+    if is_finite(fallback_value):
+        return float(fallback_value)
+    return math.nan
 
 
 # -----------------------------------------------------------------------------
@@ -1169,22 +1320,35 @@ class CameraManager:
 # Local data collection
 # -----------------------------------------------------------------------------
 
-def write_data_block(dht_samples, pressure_sensor, camera_manager):
+def write_data_block(dht_samples, bme_samples, camera_manager):
     """Aggregate current samples and append one weather/system row."""
-    dht_temperatures = [sample[0] for sample in dht_samples]
-    dht_humidities = [sample[1] for sample in dht_samples]
+    dht_temperature = median_or_nan([sample[0] for sample in dht_samples])
+    dht_humidity = median_or_nan([sample[1] for sample in dht_samples])
 
-    dht_temperature = median_or_nan(dht_temperatures)
-    dht_humidity = median_or_nan(dht_humidities)
-    pressure = read_pressure_sensor(pressure_sensor)
+    bme_temperature = median_or_nan([sample[0] for sample in bme_samples])
+    bme_humidity = median_or_nan([sample[1] for sample in bme_samples])
+    bme_pressure = median_or_nan([sample[2] for sample in bme_samples])
+    bme_gas = median_or_nan([sample[3] for sample in bme_samples])
+    bme_altitude = median_or_nan([sample[4] for sample in bme_samples])
 
-    ambient_temperature = combine_ambient_temperatures(
+    # Candidate combined channels: equal-weight mean of the two independent
+    # block medians.  Keep these separate from Ambient_* until the comparison
+    # has shown that averaging the BME680 with the DHT22 is actually desirable.
+    combined_temperature = combine_ambient_temperatures(
         dht_temperature,
-        pressure.temperature_c,
+        bme_temperature,
+    )
+    combined_humidity = combine_ambient_humidities(
+        dht_humidity,
+        bme_humidity,
     )
 
+    # Version-2 evaluation policy: DHT22 remains the default public/ambient
+    # reading, but BME680 takes over automatically if the DHT22 is unavailable.
+    ambient_temperature = primary_with_fallback(dht_temperature, bme_temperature)
+    ambient_humidity = primary_with_fallback(dht_humidity, bme_humidity)
+
     camera_lux, camera_lux_age = camera_manager.lux_with_age()
-    # Store measurement timestamps as explicit UTC.
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     weather_ok = append_csv_row(
@@ -1192,11 +1356,16 @@ def write_data_block(dht_samples, pressure_sensor, camera_manager):
         [
             timestamp,
             ambient_temperature,
+            ambient_humidity,
+            combined_temperature,
+            combined_humidity,
             dht_temperature,
             dht_humidity,
-            pressure.temperature_c,
-            pressure.pressure_hpa,
-            pressure.altitude_m,
+            bme_temperature,
+            bme_humidity,
+            bme_pressure,
+            bme_gas,
+            bme_altitude,
             camera_lux,
             camera_lux_age,
         ],
@@ -1224,16 +1393,21 @@ def write_data_block(dht_samples, pressure_sensor, camera_manager):
     log(f"Data block logged at {timestamp}")
     log(f"DHT22 valid samples in block: {len(dht_samples)}")
     log(f"DHT22 median: {dht_temperature:.2f} C, {dht_humidity:.2f} %")
-    if pressure_sensor.available:
-        log(
-            f"Pressure sensor ({pressure_sensor.name}): "
-            f"{pressure.temperature_c:.2f} C, "
-            f"{pressure.pressure_hpa:.2f} hPa, "
-            f"{pressure.altitude_m:.2f} m"
-        )
-    else:
-        log("Pressure sensor: not configured")
-    log(f"Combined ambient temperature: {ambient_temperature:.2f} C")
+    log(f"BME680 valid samples in block: {len(bme_samples)}")
+    log(
+        f"BME680 median: {bme_temperature:.2f} C, {bme_humidity:.2f} %, "
+        f"{bme_pressure:.2f} hPa, gas={bme_gas:.0f} ohm, "
+        f"altitude={bme_altitude:.2f} m"
+    )
+    log(
+        f"Combined candidate: {combined_temperature:.2f} C, "
+        f"{combined_humidity:.2f} % RH"
+    )
+    log(
+        f"Current Ambient_* default: {ambient_temperature:.2f} C, "
+        f"{ambient_humidity:.2f} % RH "
+        f"({'DHT22' if is_finite(dht_temperature) else 'BME680 fallback' if is_finite(bme_temperature) else 'unavailable'})"
+    )
     log(f"Camera lux: {camera_lux:.2f} (age {camera_lux_age:.1f} s)")
     log(f"CPU: {cpu_temp:.2f} C, {cpu_usage:.1f} %, RAM {memory_usage:.1f} %")
     log(f"Disk free: {disk_free_gb:.2f} GB; throttled={throttled_hex}")
@@ -1381,13 +1555,15 @@ def main():
     ensure_paths()
 
     dht = DHT22Reader(DHT_PIN)
-    pressure_sensor = initialize_pressure_sensor()
+    bme = BME680Reader(BME680_I2C_ADDRESS)
     camera = CameraManager()
 
     dht_samples = deque(maxlen=DHT_SAMPLE_BUFFER_SIZE)
+    bme_samples = deque(maxlen=BME680_SAMPLE_BUFFER_SIZE)
 
     start = time.monotonic()
     next_dht_poll = start
+    next_bme_poll = start
     next_data_log = start + DATA_LOG_INTERVAL_S
     next_upload = start + UPLOAD_INTERVAL_S
     next_clear = (
@@ -1401,11 +1577,12 @@ def main():
     log("Weather Station Initialized! Harvesting data...")
     log(
         f"DHT22={'available' if dht.available else 'unavailable'}, "
-        f"pressure={getattr(pressure_sensor, 'name', 'unknown')}, "
+        f"BME680={'available' if bme.available else 'unavailable'} at 0x{BME680_I2C_ADDRESS:02x}, "
         f"camera={'available' if camera.available else 'unavailable'}"
     )
     log(
         f"Cadence: DHT poll={DHT_POLL_INTERVAL_S:.1f}s, "
+        f"BME680 poll={BME680_POLL_INTERVAL_S:.1f}s, "
         f"data log={DATA_LOG_INTERVAL_S:.1f}s, upload={UPLOAD_INTERVAL_S:.1f}s"
     )
 
@@ -1423,9 +1600,17 @@ def main():
                 next_dht_poll = time.monotonic() + DHT_POLL_INTERVAL_S
 
             now = time.monotonic()
+            if now >= next_bme_poll:
+                temperature, humidity, pressure, gas, altitude, ok = bme.read_once()
+                if ok:
+                    bme_samples.append((temperature, humidity, pressure, gas, altitude))
+                next_bme_poll = time.monotonic() + BME680_POLL_INTERVAL_S
+
+            now = time.monotonic()
             if now >= next_data_log:
-                write_data_block(list(dht_samples), pressure_sensor, camera)
+                write_data_block(list(dht_samples), list(bme_samples), camera)
                 dht_samples.clear()
+                bme_samples.clear()
                 next_data_log = time.monotonic() + DATA_LOG_INTERVAL_S
 
             now = time.monotonic()
@@ -1461,10 +1646,7 @@ def main():
         raise
     finally:
         dht.close()
-        try:
-            pressure_sensor.close()
-        except Exception as exc:
-            log(f"Pressure-sensor cleanup warning: {exc}", "WARNING")
+        bme.close()
         camera.close()
         log("Weather station shutdown complete")
 
