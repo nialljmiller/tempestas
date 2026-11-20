@@ -27,10 +27,12 @@ Design goals:
 """
 
 import csv
+import functools
 import glob
 import json
 import math
 import os
+import queue
 import shutil
 import statistics
 import subprocess
@@ -247,11 +249,18 @@ CAMERA_NIGHT_PROFILES = (
 CAMERA_ROTATE_180 = True
 CAMERA_JPEG_QUALITY = 95
 
-SCP_MAX_RETRIES = 3
-SCP_RETRY_DELAY_S = 5.0
-SCP_BANDWIDTH_LIMIT_KBIT_S = "500"
-SCP_CONNECT_TIMEOUT_S = "10"
-SCP_PROCESS_TIMEOUT_S = 180
+# Uploads use rsync only: the server receives into a hidden temporary file and
+# renames it into place, so readers never see a half-written CSV or JPEG, and
+# the delta transfer sends little more than the rows added since the last
+# upload.  --bwlimit is KiB/s; 62 KiB/s matches the former scp -l 500 kbit/s.
+RSYNC_MAX_RETRIES = 3
+RSYNC_RETRY_DELAY_S = 5.0
+RSYNC_BANDWIDTH_LIMIT_KIB_S = "62"
+RSYNC_CONNECT_TIMEOUT_S = "10"
+RSYNC_PROCESS_TIMEOUT_S = 180
+# CSV snapshots for upload live in RAM (tmpfs) to avoid extra SD-card writes.
+UPLOAD_SNAPSHOT_DIR = "/dev/shm/weather_station_upload"
+UPLOAD_STOP_TIMEOUT_S = 10.0
 
 # Warn when the independent sensors disagree substantially.  Warnings do not
 # alter either raw reading or the combined value.
@@ -428,6 +437,20 @@ def mean_or_nan(values):
     return float(statistics.fmean(finite))
 
 
+# One lock serialises every write or rewrite of the local telemetry CSVs and
+# the upload snapshot, so the background upload never copies a partial row.
+CSV_LOCK = threading.RLock()
+
+
+def with_csv_lock(function):
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with CSV_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+@with_csv_lock
 def backup_incompatible_csv(path):
     """Rotate an existing CSV if its header does not match the current schema."""
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -454,6 +477,15 @@ def backup_incompatible_csv(path):
 def ensure_paths():
     os.makedirs(IMAGE_DIR, exist_ok=True)
 
+    # A capture interrupted by a restart leaves its hidden temporary JPEG(s)
+    # behind; they are never complete images, so remove them.
+    for stale in glob.glob(os.path.join(IMAGE_DIR, ".*.jpg")):
+        try:
+            os.remove(stale)
+            log(f"Removed incomplete image from interrupted capture: {stale}", "WARNING")
+        except Exception as exc:
+            log(f"Could not remove incomplete image {stale}: {exc}", "WARNING")
+
     backup_incompatible_csv(LOCAL_WEATHER_CSV)
     backup_incompatible_csv(LOCAL_SYSTEM_CSV)
 
@@ -464,6 +496,7 @@ def ensure_paths():
         write_csv_header(LOCAL_SYSTEM_CSV, SYSTEM_HEADER)
 
 
+@with_csv_lock
 def write_csv_header(path, header):
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
@@ -472,6 +505,7 @@ def write_csv_header(path, header):
         os.fsync(handle.fileno())
 
 
+@with_csv_lock
 def append_csv_row(path, row):
     """Append and fsync so a sudden power loss is less likely to lose a sample."""
     try:
@@ -486,6 +520,7 @@ def append_csv_row(path, row):
         return False
 
 
+@with_csv_lock
 def compact_csv_to_recent_rows(path, header, retain_days, reason):
     """Atomically bound a local telemetry CSV by its newest data rows.
 
@@ -550,6 +585,7 @@ def enforce_local_csv_retention(retain_days, reason):
     )
 
 
+@with_csv_lock
 def compact_csv_to_max_rows(path, header, max_data_rows, reason):
     """Apply an absolute row ceiling without assuming a sampling interval."""
     temp_path = f"{path}.retention.tmp"
@@ -2060,6 +2096,7 @@ class CameraManager:
 
         camera = self.camera
         started = False
+        image_path = None
 
         try:
             # Always meter afresh in full auto first.  This resets any manual
@@ -2086,7 +2123,11 @@ class CameraManager:
             )
 
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            image_path = os.path.join(IMAGE_DIR, f"{stamp}.jpg")
+            final_path = os.path.join(IMAGE_DIR, f"{stamp}.jpg")
+            # Write under a hidden name and rename once complete: the
+            # background upload only picks up *.jpg, so it never sees a
+            # partially written image (night-stack frames are hidden too).
+            image_path = os.path.join(IMAGE_DIR, f".{stamp}.jpg")
 
             if mode == "day":
                 # Metering deliberately used normal AE/AWB. For the final DAY
@@ -2137,14 +2178,20 @@ class CameraManager:
             if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
                 raise RuntimeError(f"camera produced an empty image: {image_path}")
 
+            os.replace(image_path, final_path)
             log(
-                f"Saved {mode.upper()} image: {image_path} "
-                f"({os.path.getsize(image_path)} bytes)"
+                f"Saved {mode.upper()} image: {final_path} "
+                f"({os.path.getsize(final_path)} bytes)"
             )
-            return image_path
+            return final_path
 
         except Exception as exc:
             log(f"Camera capture failed: {exc}", "ERROR")
+            if image_path is not None and os.path.exists(image_path):
+                try:
+                    os.remove(image_path)
+                except Exception as cleanup_exc:
+                    log(f"Could not remove incomplete image {image_path}: {cleanup_exc}", "WARNING")
             # Recreate the object on the next capture in case libcamera state is
             # wedged rather than permanently unavailable.
             self.close()
@@ -2304,59 +2351,131 @@ def write_data_block(dht_sample_map, bme_samples, camera_manager):
 # Transfers
 # -----------------------------------------------------------------------------
 
-def scp_with_retries(local_path, remote_spec):
-    for attempt in range(1, SCP_MAX_RETRIES + 1):
-        log(f"SCP attempt {attempt}/{SCP_MAX_RETRIES}: {local_path} -> {remote_spec}")
+def rsync_command(local_path, remote_spec):
+    # --ignore-times: always transfer (still as a delta).  rsync's default
+    # size + whole-second mtime check could otherwise skip a changed file.
+    return [
+        "rsync",
+        "--ignore-times",
+        f"--bwlimit={RSYNC_BANDWIDTH_LIMIT_KIB_S}",
+        "--stats",
+        "-e", f"ssh -o ConnectTimeout={RSYNC_CONNECT_TIMEOUT_S} -o BatchMode=yes",
+        local_path,
+        remote_spec,
+    ]
+
+
+def summarize_rsync_stats(output):
+    """Reduce rsync --stats output to the byte counts worth logging."""
+    wanted = ("Literal data", "Total bytes sent", "Total bytes received")
+    parts = []
+    for line in output.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() in wanted:
+            parts.append(f"{key.strip().lower()} {value.strip()}")
+    return "; ".join(parts)
+
+
+def communicate_until(process, timeout_s, stop_event):
+    """Like communicate(timeout=...), but also kill the process on shutdown."""
+    deadline = time.monotonic() + timeout_s
+    while True:
         try:
-            result = subprocess.run(
-                [
-                    "scp",
-                    "-l", SCP_BANDWIDTH_LIMIT_KBIT_S,
-                    "-o", f"ConnectTimeout={SCP_CONNECT_TIMEOUT_S}",
-                    local_path,
-                    remote_spec,
-                ],
-                check=True,
-                capture_output=True,
+            return process.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            if stop_event.is_set() or time.monotonic() >= deadline:
+                process.kill()
+                process.communicate()
+                raise
+
+
+def rsync_with_retries(local_path, remote_spec, stop_event):
+    for attempt in range(1, RSYNC_MAX_RETRIES + 1):
+        if stop_event.is_set():
+            return False
+        log(f"Rsync attempt {attempt}/{RSYNC_MAX_RETRIES}: {local_path} -> {remote_spec}")
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                rsync_command(local_path, remote_spec),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=SCP_PROCESS_TIMEOUT_S,
             )
-            if result.stderr:
-                # OpenSSH writes verbose diagnostics to stderr even on success.
-                log(f"SCP diagnostic output:\n{result.stderr.rstrip()}")
-            log(f"Copied successfully: {local_path} -> {remote_spec}")
-            return True
+            stdout, stderr = communicate_until(
+                process, RSYNC_PROCESS_TIMEOUT_S, stop_event
+            )
+            if process.returncode == 0:
+                if stderr:
+                    # OpenSSH writes verbose diagnostics to stderr even on success.
+                    log(f"Rsync diagnostic output:\n{stderr.rstrip()}")
+                log(
+                    f"Copied successfully: {local_path} -> {remote_spec} "
+                    f"({summarize_rsync_stats(stdout)}; "
+                    f"{time.monotonic() - started:.1f} s)"
+                )
+                return True
+            log(f"Rsync failed on attempt {attempt} with code {process.returncode}", "ERROR")
+            if stdout:
+                log(f"Rsync stdout:\n{stdout.rstrip()}", "ERROR")
+            if stderr:
+                log(f"Rsync stderr:\n{stderr.rstrip()}", "ERROR")
 
-        except subprocess.TimeoutExpired as exc:
-            log(f"SCP timed out on attempt {attempt}: {exc}", "ERROR")
-        except subprocess.CalledProcessError as exc:
-            log(f"SCP failed on attempt {attempt} with code {exc.returncode}", "ERROR")
-            if exc.stdout:
-                log(f"SCP stdout:\n{exc.stdout.rstrip()}", "ERROR")
-            if exc.stderr:
-                log(f"SCP stderr:\n{exc.stderr.rstrip()}", "ERROR")
+        except subprocess.TimeoutExpired:
+            if stop_event.is_set():
+                log(f"Rsync stopped for shutdown: {local_path}", "WARNING")
+                return False
+            log(
+                f"Rsync timed out on attempt {attempt} after "
+                f"{RSYNC_PROCESS_TIMEOUT_S} s",
+                "ERROR",
+            )
         except Exception as exc:
-            log(f"Unexpected SCP failure on attempt {attempt}: {exc}", "ERROR")
+            log(f"Unexpected rsync failure on attempt {attempt}: {exc}", "ERROR")
 
-        if attempt < SCP_MAX_RETRIES:
-            time.sleep(SCP_RETRY_DELAY_S)
+        if attempt < RSYNC_MAX_RETRIES and stop_event.wait(RSYNC_RETRY_DELAY_S):
+            return False
 
     return False
 
 
-def send_data():
+def upload_csv_snapshot(local_path, remote_path, stop_event):
+    """Upload a copy of a telemetry CSV taken under CSV_LOCK.
+
+    The live file keeps receiving rows while the copy is transferred; rows
+    added after the snapshot go out with the next upload.
+    """
+    snapshot = os.path.join(UPLOAD_SNAPSHOT_DIR, os.path.basename(local_path))
+    try:
+        os.makedirs(UPLOAD_SNAPSHOT_DIR, exist_ok=True)
+        with CSV_LOCK:
+            shutil.copyfile(local_path, snapshot)
+        return rsync_with_retries(
+            snapshot, f"{SERVER_ADDRESS}:{remote_path}", stop_event
+        )
+    except Exception as exc:
+        log(f"Could not prepare upload snapshot of {local_path}: {exc}", "ERROR")
+        return False
+    finally:
+        try:
+            os.remove(snapshot)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log(f"Could not remove upload snapshot {snapshot}: {exc}", "WARNING")
+
+
+def send_data(stop_event):
     """Transfer telemetry first, then drain a bounded slice of image backlog."""
     log("Beginning transfer phase")
 
     # Environmental/system telemetry is the primary product. Send it before
     # doing any camera work so camera delays or image backlog cannot block it.
-    weather_ok = scp_with_retries(
-        LOCAL_WEATHER_CSV,
-        f"{SERVER_ADDRESS}:{SERVER_WEATHER_CSV}",
+    weather_ok = upload_csv_snapshot(
+        LOCAL_WEATHER_CSV, SERVER_WEATHER_CSV, stop_event
     )
-    system_ok = scp_with_retries(
-        LOCAL_SYSTEM_CSV,
-        f"{SERVER_ADDRESS}:{SERVER_SYSTEM_CSV}",
+    system_ok = upload_csv_snapshot(
+        LOCAL_SYSTEM_CSV, SERVER_SYSTEM_CSV, stop_event
     )
 
     if weather_ok and system_ok:
@@ -2371,13 +2490,14 @@ def send_data():
     # Only start backlog work when both primary telemetry streams reached the
     # server.  The per-cycle cap prevents months of images from blocking fresh
     # measurements after reconnection; repeated cycles eventually drain all of
-    # them, oldest first.
+    # them, oldest first.  Captures are written under a hidden name and renamed,
+    # so every *.jpg listed here is a complete image.
     backlog = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg")))
     transferred = 0
     if weather_ok and system_ok:
         for image_path in backlog[:IMAGE_BACKLOG_UPLOADS_PER_CYCLE]:
-            if not scp_with_retries(
-                image_path, f"{SERVER_ADDRESS}:{SERVER_IMAGE_DIR}"
+            if not rsync_with_retries(
+                image_path, f"{SERVER_ADDRESS}:{SERVER_IMAGE_DIR}", stop_event
             ):
                 break
             try:
@@ -2400,6 +2520,64 @@ def send_data():
         )
 
     return weather_ok, system_ok
+
+
+class UploadWorker:
+    """Run send_data() in one background thread so sampling continues.
+
+    At most one transfer runs at a time.  The result is handed back to the
+    scheduler through a queue, so connectivity state and CSV compaction are
+    still decided only in the main thread.
+    """
+
+    def __init__(self):
+        self._thread = None
+        self._results = queue.Queue()
+        self._stop_event = threading.Event()
+
+    def busy(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        # Also wait until the scheduler has taken the previous result.
+        if self.busy() or not self._results.empty():
+            return False
+        self._thread = threading.Thread(
+            target=self._run, name="upload", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def _run(self):
+        started = time.monotonic()
+        try:
+            status = send_data(self._stop_event)
+        except Exception as exc:
+            # send_data is already defensive, but the worker itself is the
+            # final containment boundary.
+            log(f"Unhandled transfer-phase error: {exc}", "ERROR")
+            status = (False, False)
+        log(
+            f"Transfer phase finished in {time.monotonic() - started:.1f} s: "
+            f"weather={status[0]}, system={status[1]}"
+        )
+        self._results.put(status)
+
+    def poll_result(self):
+        """Return (weather_ok, system_ok) of a finished upload, else None."""
+        try:
+            return self._results.get_nowait()
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            log("Stopping background upload")
+            thread.join(timeout=UPLOAD_STOP_TIMEOUT_S)
+            if thread.is_alive():
+                log("Background upload did not stop in time", "WARNING")
 
 
 # -----------------------------------------------------------------------------
@@ -2441,6 +2619,7 @@ def main():
     connectivity_state = load_connectivity_state()
     last_policy_name = None
 
+    uploader = UploadWorker()
     last_upload_status = (False, False)
     dht_power_failure_confirmations = 0
     last_dht_power_reset_monotonic = -math.inf
@@ -2574,16 +2753,19 @@ def main():
                 enforce_image_disk_reserve()
                 next_image_capture = time.monotonic() + image_interval
 
+            # Uploads run in the background.  Start one when due; if the
+            # previous one is still running, skip this cycle.  The finished
+            # result is handled below exactly as the synchronous upload was,
+            # including scheduling the next upload from its completion.
             now = time.monotonic()
             if now >= next_upload:
-                try:
-                    last_upload_status = send_data()
-                except Exception as exc:
-                    # send_data is already defensive, but the scheduler itself
-                    # is the final containment boundary.
-                    log(f"Unhandled transfer-phase error: {exc}", "ERROR")
-                    last_upload_status = (False, False)
+                if not uploader.start():
+                    log("Previous upload still running; skipping this upload cycle", "WARNING")
+                next_upload = time.monotonic() + UPLOAD_INTERVAL_S
 
+            upload_result = uploader.poll_result()
+            if upload_result is not None:
+                last_upload_status = upload_result
                 if all(last_upload_status):
                     was_offline = connectivity_state.get("offline_since_epoch")
                     connectivity_state = {
@@ -2605,7 +2787,7 @@ def main():
                 save_connectivity_state(connectivity_state)
 
                 # A successful copy permits the shorter normal resend window.
-                # Compact each stream independently: one successful SCP must
+                # Compact each stream independently: one successful upload must
                 # never authorize trimming the other stream.
                 if last_upload_status[0]:
                     compact_csv_to_recent_rows(
@@ -2658,6 +2840,7 @@ def main():
         log(f"Fatal scheduler error: {exc}", "ERROR")
         raise
     finally:
+        uploader.stop()
         for reader in dht_readers:
             reader.close()
         bme.close()
