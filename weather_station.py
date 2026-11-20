@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Tempestas Raspberry Pi weather station.
 
-Current hardware:
-  * DHT22 / AM2302 on GPIO4: temperature + relative humidity
-  * BME680 on I2C address 0x77: temperature + relative humidity + pressure +
-    gas resistance
-  * Raspberry Pi camera (Picamera2)
+Current hardware is discovered by weather_sensor_test.py and stored in
+~/weather_hardware.json.  The station reads that file at startup instead of
+hard-coding GPIO assignments.  It supports multiple DHT22 / AM2302 sensors,
+an optional BME280 on I2C address 0x76 or 0x77, and the Raspberry Pi camera.
 
-The DHT22 and BME680 are retained as independent sensors and all raw readings
-are stored.  Combined temperature and humidity are the arithmetic mean of the
-two block-median sensor readings when both are available.  For this evaluation
-phase the DHT22 remains the default Ambient_* source, with BME680 as automatic
-fallback; the Combined_* channels can become the default later if they perform
-well.
+All discovered DHT22 sensors are retained as independent inputs.  Each DHT is
+sampled continuously every ~2.1 s into a five-attempt rolling buffer (failed
+attempts are stored as NaN).  Logical 5-s DHT samples are reconstructed at a
+2.1-s look-back using one-point passthrough, two-point linear interpolation, or
+shape-preserving PCHIP interpolation for three or more valid observations.
+Those logical samples are then block-medianed and combined into a DHT ensemble
+value.  When a BME280 is present, its readings remain independent and the
+Combined_* channels compare/average the DHT ensemble with the BME280.  Ambient_*
+uses the DHT ensemble first and falls back to BME280 when no DHT reading is
+available.
 
 Design goals:
   * one failed sensor must not terminate the station
@@ -20,16 +23,19 @@ Design goals:
   * camera/network work must not trigger extra environmental-sensor reads
   * preserve useful diagnostic output under systemd
   * never silently invent replacement sensor values
-  * never delete local CSV data unless the corresponding upload succeeded
+  * retain a bounded local resend window without risking filesystem exhaustion
 """
 
 import csv
 import glob
+import json
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -47,12 +53,12 @@ else:
     DHT_IMPORT_ERROR = None
 
 try:
-    import adafruit_bme680
+    import adafruit_bme280.basic as adafruit_bme280
 except Exception as exc:
-    adafruit_bme680 = None
-    BME680_IMPORT_ERROR = exc
+    adafruit_bme280 = None
+    BME280_IMPORT_ERROR = exc
 else:
-    BME680_IMPORT_ERROR = None
+    BME280_IMPORT_ERROR = None
 
 try:
     from picamera2 import Picamera2
@@ -81,37 +87,101 @@ BASE_DIR = "/home/njm"
 IMAGE_DIR = os.path.join(BASE_DIR, "images")
 LOCAL_WEATHER_CSV = os.path.join(BASE_DIR, "weather_data.csv")
 LOCAL_SYSTEM_CSV = os.path.join(BASE_DIR, "system_usage.csv")
+HARDWARE_CONFIG_PATH = os.path.join(BASE_DIR, "weather_hardware.json")
+CONNECTIVITY_STATE_PATH = os.path.join(BASE_DIR, "weather_connectivity_state.json")
 
 SERVER_ADDRESS = "nill@nillmill.ddns.net"
-SERVER_BASE = "/media/bigdata/weather_station"
+SERVER_BASE = "/media/data/weather_station"
 SERVER_IMAGE_DIR = os.path.join(SERVER_BASE, "images/")
 SERVER_WEATHER_CSV = os.path.join(SERVER_BASE, "weather_data.csv")
 SERVER_SYSTEM_CSV = os.path.join(SERVER_BASE, "system_usage.csv")
 
-# DHT22 / AM2302: Adafruit specifies no more than 0.5 Hz (one read / 2 s).
-# Five seconds is intentionally conservative and gives six nominal samples per
-# 30-second logged block without hammering a timing-sensitive sensor.
-DHT_PIN = board.D4
+# Sensor assignments are populated from HARDWARE_CONFIG_PATH.  These defaults
+# preserve the pre-discovery setup only when the config file does not yet exist.
+DEFAULT_DHT_GPIOS = [4]
+DEFAULT_DHT_POWER_GPIO = 17       # physical pin 11: switched 3.3-V rail for DHTs
+DEFAULT_DHT_POWER_PHYSICAL_PIN = 11
+DEFAULT_BME280_I2C_ADDRESS = 0x77
+
+# DHT22 / AM2302 acquisition has two layers:
+#
+#   physical sampler:
+#       each sensor is polled continuously in its own background worker at the
+#       DHT22-safe cadence (~2.1 s). Every attempt enters a five-attempt rolling
+#       buffer. Failed attempts enter as NaN rather than leaving old data behind.
+#
+#   logical sampler:
+#       the existing weather-station scheduler still asks each DHT reader for
+#       one value every 5 s. read_once() does NOT touch the hardware. Instead it
+#       estimates the value at (request time - 2.1 s) from the rolling physical
+#       samples. This normally places the target between real observations, so
+#       the result is interpolation rather than extrapolation.
+#
+# With one valid point, that point is returned. With two valid points, linear
+# interpolation is used. With three or more valid points, a shape-preserving
+# PCHIP interpolation is used. If the target is not bracketed by valid samples,
+# the nearest valid observation is returned rather than extrapolating.
 DHT_POLL_INTERVAL_S = 5.0
+DHT_PHYSICAL_POLL_INTERVAL_S = 2.1
+DHT_INTERPOLATION_LOOKBACK_S = 2.1
+DHT_ROLLING_ATTEMPTS = 5
+DHT_SENSOR_START_STAGGER_S = 0.10
+
+# The DHT library bit-bangs timing-critical GPIO transactions in user space.
+# Only one physical DHT transaction is allowed to run at a time, even though
+# each sensor has its own background worker. Workers are staggered so this lock
+# is normally uncontended.
+DHT_PHYSICAL_IO_LOCK = threading.Lock()
+
 DHT_REINITIALIZE_AFTER_FAILURES = 12
 DHT_SAMPLE_BUFFER_SIZE = 24
 
-# BME680: use the address actually detected by i2cdetect on this station.
-# It is sampled at the same conservative cadence as the DHT22 so each 30-second
-# record represents comparable time coverage from both sensors.
-BME680_I2C_ADDRESS = 0x77
-BME680_POLL_INTERVAL_S = 5.0
-BME680_REINITIALIZE_AFTER_FAILURES = 6
-BME680_SAMPLE_BUFFER_SIZE = 24
+# GPIO17 / physical pin 11 now powers both DHT sensors directly.  A real
+# power-cycle is therefore possible without rebooting the Raspberry Pi.  The
+# station only performs one automatically when every configured DHT has a full
+# five-attempt rolling buffer containing zero valid measurements for multiple
+# logical checks.  A cooldown prevents repeated cycling if there is a genuine
+# wiring/sensor fault rather than the observed DHT latch-up.
+DHT_POWER_OFF_S = 5.0
+DHT_POWER_STARTUP_S = 3.0
+DHT_POWER_RESET_CONFIRMATIONS = 2
+DHT_POWER_RESET_COOLDOWN_S = 60.0
+
+# BME280 is optional.  weather_sensor_test.py writes null when no BME280 is
+# detected; the station then leaves the I2C reader disabled until discovery is
+# run again.
+BME280_POLL_INTERVAL_S = 5.0
+BME280_REINITIALIZE_AFTER_FAILURES = 6
+BME280_SAMPLE_BUFFER_SIZE = 24
 # Altitude is derived from pressure, not a direct sensor measurement.  Keep the
 # standard sea-level reference explicit so the stored value is reproducible.
-BME680_SEA_LEVEL_PRESSURE_HPA = 1013.25
+BME280_SEA_LEVEL_PRESSURE_HPA = 1013.25
 
 DATA_LOG_INTERVAL_S = 30.0
 UPLOAD_INTERVAL_S = 300.0
-# Robustness default: keep the local CSV history indefinitely.  Set this to
-# a positive number only if you explicitly want confirmed-upload cleanup.
-LOCAL_CSV_CLEAR_INTERVAL_S = None
+# The server is the permanent archive.  The Pi retains a rolling resend window,
+# not an unbounded second archive. After a confirmed upload, compact to seven
+# days at normal cadence. During an outage, adaptive sampling greatly extends
+# that span; an absolute row ceiling remains as a final software guard.
+LOCAL_CSV_RETAIN_AFTER_UPLOAD_DAYS = 7
+LOCAL_CSV_RETENTION_CHECK_INTERVAL_S = 3600.0
+LOCAL_CSV_ABSOLUTE_MAX_ROWS = 250_000
+
+# Simple store-and-forward policy.  An outage progressively trades temporal
+# resolution for endurance.  The state is persisted, so a reboot without Wi-Fi
+# does not reset the station to its most storage-intensive mode.
+OFFLINE_POLICIES = (
+    # minimum outage, telemetry interval, image interval, reconnect probe
+    (0,          30.0,      300.0,      300.0,  "normal-first-day"),
+    (24 * 3600,  300.0,     3600.0,     900.0,  "hourly-images-first-week"),
+    (7 * 86400,  900.0,     6 * 3600,   1800.0, "six-hour-images-first-month"),
+    (30 * 86400, 3600.0,    24 * 3600,  3600.0, "daily-images-long-term"),
+)
+IMAGE_BACKLOG_UPLOADS_PER_CYCLE = 2
+# Last-resort rolling mode.  Oldest local images are removed only as needed to
+# preserve this much working space; sparse CSV telemetry continues.
+MIN_FREE_DISK_GB = 5.0
+MIN_FREE_DISK_PERCENT = 5.0
 
 # Camera scene classification uses hysteresis so dusk/dawn does not cause the
 # camera to flap between profiles every five minutes.  Lux is the primary
@@ -128,10 +198,26 @@ CAMERA_METER_MAX_FRAMES = 10
 CAMERA_METER_REQUIRED_STABLE = 2
 CAMERA_STABLE_THRESHOLD = 0.03
 
-# Day profile: retain normal colour capture and correct the failed IR-cut filter
-# afterwards.  Twilight deliberately desaturates because near-IR increasingly
-# dominates and true colour becomes unreliable.
-CAMERA_DAY_SATURATION = 1.0
+# The IMX477 is intentionally operated with its physical IR-cut filter out so
+# nighttime near-IR sensitivity is preserved. Daytime therefore uses the fixed
+# NoIR colour calibration tuned interactively with rpicam-vid.
+#
+# These are ISP/libcamera controls, not a post-JPEG/Pillow colour transform.
+# Metering still begins with AE/AWB enabled; after classification as DAY, AWB is
+# disabled and these calibrated controls settle before the final JPEG capture.
+CAMERA_METER_SATURATION = 1.0
+CAMERA_DAY_NOIR_RED_GAIN = 0.90
+CAMERA_DAY_NOIR_BLUE_GAIN = 1.30
+CAMERA_DAY_NOIR_SATURATION = 1.40
+CAMERA_DAY_NOIR_CCM = (
+     1.35, -0.25, -0.10,
+    -0.15,  1.30, -0.15,
+    -0.10, -0.25,  1.35,
+)
+CAMERA_DAY_CONTROL_SETTLE_FRAMES = 3
+
+# Twilight deliberately remains strongly desaturated because near-IR becomes
+# increasingly dominant and faithful colour reconstruction is unreliable.
 CAMERA_TWILIGHT_SATURATION = 0.20
 CAMERA_TWILIGHT_EXPOSURE_VALUE = 0.5
 
@@ -155,24 +241,9 @@ CAMERA_NIGHT_PROFILES = (
     (-math.inf, 3_000_000, 10.0),
 )
 
-# The camera's IR-cut filter has failed, producing a strong magenta cast in
-# daylight.  This 3x3 RGB correction matrix was tuned against a representative
-# image from this specific camera.  It is used only in DAY mode.
-#
-# PIL's RGB conversion matrix is:
-#   R' = aR + bG + cB + d
-#   G' = eR + fG + gB + h
-#   B' = iR + jG + kB + l
-CAMERA_IR_CUT_COMPENSATION = True
-CAMERA_IR_COLOUR_MATRIX = (
-    0.6, 0.05, 0.00, 0.0,
-    0.00, 1.0, 0.00, 0.0,
-    0.00, 0.05, 0.70, 0.0,
-)
-# The failed IR-cut filter makes some foliage/highlights carry false chroma even
-# after channel balancing.  Blend the corrected DAY image slightly toward
-# grayscale so that residual IR colour does not become neon green/magenta.
-CAMERA_DAY_POST_SATURATION = 0.75
+# Rotation is still performed in libcamera. Pillow remains a dependency only
+# for NIGHT frame stacking; DAY colour correction now occurs entirely in the
+# camera ISP so there is exactly one daylight correction stage.
 CAMERA_ROTATE_180 = True
 CAMERA_JPEG_QUALITY = 95
 
@@ -187,6 +258,105 @@ SCP_PROCESS_TIMEOUT_S = 180
 TEMPERATURE_DISAGREEMENT_WARN_C = 2.0
 HUMIDITY_DISAGREEMENT_WARN_PERCENT = 10.0
 
+
+def load_hardware_config(path=HARDWARE_CONFIG_PATH):
+    """Load the hardware map written by weather_sensor_test.py.
+
+    If discovery has never been run, retain the previous single-DHT/BME280
+    defaults. If discovery *has* run, an explicitly absent BME280 remains
+    disabled instead of being repeatedly probed.
+    """
+    fallback = {
+        "version": 3,
+        "dht22": [{"gpio": gpio} for gpio in DEFAULT_DHT_GPIOS],
+        "dht_power": {
+            "gpio": DEFAULT_DHT_POWER_GPIO,
+            "physical_pin": DEFAULT_DHT_POWER_PHYSICAL_PIN,
+        },
+        "bme280": {"address": DEFAULT_BME280_I2C_ADDRESS},
+    }
+
+    if not os.path.exists(path):
+        return fallback
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        if not isinstance(config, dict):
+            raise ValueError("hardware config root is not an object")
+        return config
+    except Exception as exc:
+        # Logging is not defined yet at module-import time.
+        print(
+            f"WARNING: could not load {path}: {exc}; using legacy defaults",
+            file=sys.stderr,
+            flush=True,
+        )
+        return fallback
+
+
+HARDWARE_CONFIG = load_hardware_config()
+
+_dht_power_config = HARDWARE_CONFIG.get("dht_power")
+if isinstance(_dht_power_config, dict) and _dht_power_config.get("gpio") is not None:
+    try:
+        DHT_POWER_GPIO = int(_dht_power_config["gpio"])
+    except (TypeError, ValueError):
+        DHT_POWER_GPIO = DEFAULT_DHT_POWER_GPIO
+else:
+    # Existing version-1 hardware maps predate the switched DHT supply.  The
+    # physical wiring has now moved to GPIO17, so use that as the compatibility
+    # default until the tester rewrites the config as version 2.
+    DHT_POWER_GPIO = DEFAULT_DHT_POWER_GPIO
+
+DHT_POWER_PHYSICAL_PIN = DEFAULT_DHT_POWER_PHYSICAL_PIN
+
+DHT_GPIOS = []
+for entry in HARDWARE_CONFIG.get("dht22", []):
+    try:
+        gpio = int(entry["gpio"] if isinstance(entry, dict) else entry)
+    except (KeyError, TypeError, ValueError):
+        continue
+    if gpio == DHT_POWER_GPIO:
+        print(
+            f"WARNING: ignoring GPIO{gpio} as DHT data because it is the "
+            "configured DHT power rail",
+            file=sys.stderr,
+            flush=True,
+        )
+        continue
+    if gpio not in DHT_GPIOS:
+        DHT_GPIOS.append(gpio)
+
+_bme_config = HARDWARE_CONFIG.get("bme280")
+if _bme_config is None:
+    # Backward compatibility with the previous BME280-labelled hardware map.
+    # Only the I2C address is reused; this station now initializes a BME280.
+    _bme_config = HARDWARE_CONFIG.get("bme680")
+
+if isinstance(_bme_config, dict) and _bme_config.get("address") is not None:
+    try:
+        BME280_I2C_ADDRESS = int(_bme_config["address"])
+    except (TypeError, ValueError):
+        BME280_I2C_ADDRESS = None
+else:
+    BME280_I2C_ADDRESS = None
+
+
+# Preserve the historical aggregate DHT22 columns, then add one raw pair for
+# every discovered DHT so downstream analysis can inspect the sensors
+# independently.  A changed sensor count deliberately changes the CSV schema;
+# backup_incompatible_csv() will preserve the previous local file.
+_DHT_DETAIL_HEADER = []
+for _index, _gpio in enumerate(DHT_GPIOS, start=1):
+    _DHT_DETAIL_HEADER.extend(
+        [
+            f"DHT22_{_index}_GPIO",
+            f"DHT22_{_index}_Temperature_C",
+            f"DHT22_{_index}_Humidity_percent",
+        ]
+    )
+
 WEATHER_HEADER = [
     "Timestamp",
     "Ambient_Temperature_C",
@@ -195,11 +365,11 @@ WEATHER_HEADER = [
     "Combined_Humidity_percent",
     "DHT22_Temperature_C",
     "DHT22_Humidity_percent",
-    "BME680_Temperature_C",
-    "BME680_Humidity_percent",
-    "BME680_Pressure_hPa",
-    "BME680_Gas_Resistance_ohm",
-    "BME680_Altitude_m",
+    *_DHT_DETAIL_HEADER,
+    "BME280_Temperature_C",
+    "BME280_Humidity_percent",
+    "BME280_Pressure_hPa",
+    "BME280_Altitude_m",
     "Camera_Lux",
     "Camera_Lux_Age_s",
 ]
@@ -316,6 +486,195 @@ def append_csv_row(path, row):
         return False
 
 
+def compact_csv_to_recent_rows(path, header, retain_days, reason):
+    """Atomically bound a local telemetry CSV by its newest data rows.
+
+    Row-count retention is deliberate: it remains reliable if timestamps are
+    malformed and avoids loading the CSV into RAM.  The configured logging
+    cadence determines the maximum row count.  The header is always retained.
+    """
+    rows_per_day = max(1, math.ceil(86400.0 / DATA_LOG_INTERVAL_S))
+    keep_data_rows = max(1, int(retain_days * rows_per_day))
+    temp_path = f"{path}.retention.tmp"
+
+    try:
+        with open(path, "r", newline="") as source:
+            reader = csv.reader(source)
+            actual_header = next(reader, None)
+            if actual_header != header:
+                log(
+                    f"Skipping retention for {path}: unexpected CSV header",
+                    "ERROR",
+                )
+                return False
+            recent_rows = deque(maxlen=keep_data_rows)
+            total_data_rows = 0
+            for row in reader:
+                recent_rows.append(row)
+                total_data_rows += 1
+
+        # Avoid rewriting files that are already inside the requested bound.
+        if total_data_rows <= keep_data_rows:
+            return True
+
+        with open(temp_path, "w", newline="") as destination:
+            writer = csv.writer(destination)
+            writer.writerow(header)
+            writer.writerows(recent_rows)
+            destination.flush()
+            os.fsync(destination.fileno())
+
+        os.replace(temp_path, path)
+        log(
+            f"Compacted {path} to {len(recent_rows)} newest rows "
+            f"({retain_days:g} days; {reason})"
+        )
+        return True
+    except Exception as exc:
+        log(f"CSV retention failed for {path}: {exc}", "ERROR")
+        return False
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def enforce_local_csv_retention(retain_days, reason):
+    compact_csv_to_recent_rows(
+        LOCAL_WEATHER_CSV, WEATHER_HEADER, retain_days, reason
+    )
+    compact_csv_to_recent_rows(
+        LOCAL_SYSTEM_CSV, SYSTEM_HEADER, retain_days, reason
+    )
+
+
+def compact_csv_to_max_rows(path, header, max_data_rows, reason):
+    """Apply an absolute row ceiling without assuming a sampling interval."""
+    temp_path = f"{path}.retention.tmp"
+    try:
+        with open(path, "r", newline="") as source:
+            reader = csv.reader(source)
+            if next(reader, None) != header:
+                log(f"Skipping hard retention for {path}: unexpected header", "ERROR")
+                return False
+            rows = deque(maxlen=max_data_rows)
+            total = 0
+            for row in reader:
+                rows.append(row)
+                total += 1
+        if total <= max_data_rows:
+            return True
+        with open(temp_path, "w", newline="") as destination:
+            writer = csv.writer(destination)
+            writer.writerow(header)
+            writer.writerows(rows)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temp_path, path)
+        log(f"Compacted {path} to {len(rows)} rows ({reason})", "WARNING")
+        return True
+    except Exception as exc:
+        log(f"Hard CSV retention failed for {path}: {exc}", "ERROR")
+        return False
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def load_connectivity_state():
+    default = {"offline_since_epoch": None, "last_success_epoch": None}
+    try:
+        with open(CONNECTIVITY_STATE_PATH, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        if not isinstance(value, dict):
+            return default
+        return {
+            "offline_since_epoch": value.get("offline_since_epoch"),
+            "last_success_epoch": value.get("last_success_epoch"),
+        }
+    except FileNotFoundError:
+        return default
+    except Exception as exc:
+        log(f"Could not load connectivity state: {exc}", "WARNING")
+        return default
+
+
+def save_connectivity_state(state):
+    temp_path = f"{CONNECTIVITY_STATE_PATH}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, CONNECTIVITY_STATE_PATH)
+    except Exception as exc:
+        log(f"Could not save connectivity state: {exc}", "ERROR")
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def select_offline_policy(state):
+    offline_since = state.get("offline_since_epoch")
+    outage_seconds = 0.0
+    if isinstance(offline_since, (int, float)):
+        outage_seconds = max(0.0, time.time() - float(offline_since))
+
+    policy_index = 0
+    for index, policy in enumerate(OFFLINE_POLICIES):
+        if outage_seconds >= policy[0]:
+            policy_index = index
+
+    usage = shutil.disk_usage(BASE_DIR)
+    free_percent = 100.0 * usage.free / usage.total if usage.total else 0.0
+    # Storage pressure can advance the policy early, but never makes it less
+    # conservative than the elapsed-outage policy.
+    if free_percent < 10.0:
+        policy_index = len(OFFLINE_POLICIES) - 1
+    elif free_percent < 20.0:
+        policy_index = min(len(OFFLINE_POLICIES) - 1, policy_index + 1)
+
+    return OFFLINE_POLICIES[policy_index], outage_seconds, free_percent
+
+
+def enforce_image_disk_reserve():
+    """Delete oldest local backlog images only when the reserve is threatened."""
+    usage = shutil.disk_usage(BASE_DIR)
+    reserve_bytes = max(
+        int(MIN_FREE_DISK_GB * 1024 ** 3),
+        int(usage.total * MIN_FREE_DISK_PERCENT / 100.0),
+    )
+    if usage.free >= reserve_bytes:
+        return 0
+
+    removed = 0
+    for path in sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg"))):
+        try:
+            os.remove(path)
+            removed += 1
+        except Exception as exc:
+            log(f"Could not remove oldest backlog image {path}: {exc}", "ERROR")
+        if shutil.disk_usage(BASE_DIR).free >= reserve_bytes:
+            break
+
+    if removed:
+        log(
+            f"Disk reserve protected by removing {removed} oldest local "
+            "backlog image(s)",
+            "WARNING",
+        )
+    return removed
+
+
 # -----------------------------------------------------------------------------
 # Raspberry Pi system telemetry
 # -----------------------------------------------------------------------------
@@ -380,130 +739,648 @@ def get_throttled_hex():
 
 
 # -----------------------------------------------------------------------------
+# DHT22 switched power rail
+# -----------------------------------------------------------------------------
+
+def set_dht_power(enabled):
+    """Drive the switched DHT supply on GPIO17 (physical pin 11).
+
+    The two DHT VCC pins and their DATA pull-ups are powered from this GPIO.
+    Driving it low therefore removes both VCC and pull-up power, giving the
+    sensors the same cold reset that previously required unplugging the Pi.
+    """
+    if DHT_POWER_GPIO is None:
+        return True
+
+    pinctrl = shutil.which("pinctrl")
+    if pinctrl is None:
+        log("Cannot control DHT power: pinctrl command not found", "ERROR")
+        return False
+
+    drive = "dh" if enabled else "dl"
+    try:
+        result = subprocess.run(
+            [pinctrl, "set", str(DHT_POWER_GPIO), "op", drive],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        state = "ON/HIGH" if enabled else "OFF/LOW"
+        log(
+            f"DHT switched power GPIO{DHT_POWER_GPIO} / physical pin "
+            f"{DHT_POWER_PHYSICAL_PIN}: {state}"
+        )
+        return True
+    except Exception as exc:
+        log(
+            f"Failed to set DHT power GPIO{DHT_POWER_GPIO} "
+            f"{'HIGH' if enabled else 'LOW'}: {exc}",
+            "ERROR",
+        )
+        return False
+
+
+def ensure_dht_power_on(settle=True):
+    """Power the DHT rail before creating any DHT driver objects."""
+    if not DHT_GPIOS:
+        return True
+    if not set_dht_power(True):
+        return False
+    if settle:
+        time.sleep(DHT_POWER_STARTUP_S)
+    return True
+
+
+def power_cycle_dht_readers(readers):
+    """Cold-reset all configured DHTs and restart their sampler threads."""
+    if not readers:
+        return False
+
+    log(
+        "All DHT rolling buffers are fully invalid; beginning automatic "
+        "cold power-cycle",
+        "ERROR",
+    )
+
+    # No DHT object may be touching a data pin while VCC is being removed.
+    for reader in readers:
+        reader.close()
+
+    if not set_dht_power(False):
+        log("DHT cold reset aborted because power could not be switched off", "ERROR")
+        for reader in readers:
+            reader.restart_after_power_cycle()
+        return False
+
+    time.sleep(DHT_POWER_OFF_S)
+
+    if not set_dht_power(True):
+        log("DHT cold reset failed because power could not be restored", "ERROR")
+        return False
+
+    time.sleep(DHT_POWER_STARTUP_S)
+
+    successes = []
+    for reader in readers:
+        successes.append(reader.restart_after_power_cycle())
+
+    ok = all(successes)
+    log(
+        "DHT cold power-cycle complete; physical samplers restarted"
+        if ok
+        else "DHT cold power-cycle completed but one or more interfaces did not initialize",
+        "INFO" if ok else "ERROR",
+    )
+    return ok
+
+
+# -----------------------------------------------------------------------------
 # DHT22 / AM2302
 # -----------------------------------------------------------------------------
 
 class DHT22Reader:
-    """Fault-tolerant DHT22 reader with controlled polling and reinitialization."""
+    """Continuously sampled DHT22 reader with interpolated logical output.
 
-    def __init__(self, pin):
+    Physical acquisition is independent of the weather-station scheduler.
+    A background thread performs one DHT transaction every
+    DHT_PHYSICAL_POLL_INTERVAL_S seconds and appends an entry to a rolling
+    DHT_ROLLING_ATTEMPTS-element buffer:
+
+        (sample_monotonic_time, temperature, humidity)
+
+    Failed transactions append NaN values, so repeated failures naturally evict
+    old successful measurements.
+
+    read_once() is intentionally a *logical* read. It never accesses the DHT
+    hardware. It evaluates the rolling buffer at
+
+        time.monotonic() - DHT_INTERPOLATION_LOOKBACK_S
+
+    using:
+      * 0 valid samples: failure / NaN
+      * 1 valid sample : return it directly
+      * 2 valid samples: linear interpolation
+      * 3+ valid samples: shape-preserving PCHIP interpolation
+
+    Extrapolation is deliberately forbidden. If the requested target is outside
+    the span of valid observations, the nearest valid observation is returned.
+    """
+
+    def __init__(self, pin, gpio, sensor_index):
         self.pin = pin
+        self.gpio = int(gpio)
+        self.sensor_index = int(sensor_index)
+        self.label = f"DHT22[{self.sensor_index}] GPIO{self.gpio}"
+
         self.sensor = None
         self.consecutive_failures = 0
         self.last_attempt_monotonic = None
         self.last_good = (math.nan, math.nan)
         self.last_good_monotonic = None
+
+        # One entry is retained for every physical attempt, including failures.
+        # NaN therefore ages out old good data automatically.
+        self._attempt_buffer = deque(maxlen=DHT_ROLLING_ATTEMPTS)
+        self._buffer_lock = threading.Lock()
+
+        # Only the background sampler touches the DHT object during normal
+        # operation. The lock also makes shutdown/reinitialization race-safe.
+        self._sensor_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._sampler_thread = None
+
         self.initialize()
+        self._start_background_sampler()
 
     @property
     def available(self):
-        return self.sensor is not None
+        with self._sensor_lock:
+            return self.sensor is not None
 
-    def initialize(self):
-        self.close()
+    def _close_sensor_locked(self):
+        if self.sensor is not None:
+            try:
+                self.sensor.exit()
+            except Exception as exc:
+                log(f"{self.label} cleanup warning: {exc}", "WARNING")
+        self.sensor = None
+
+    def _initialize_sensor_locked(self):
+        self._close_sensor_locked()
 
         if adafruit_dht is None:
             log(f"DHT library unavailable: {DHT_IMPORT_ERROR}", "ERROR")
             return False
 
         try:
-            # use_pulseio=False is the reliable Linux/Raspberry Pi path and is
-            # the same mode that succeeded in the direct hardware test.
-            self.sensor = adafruit_dht.DHT22(self.pin, use_pulseio=False)
+            # use_pulseio=False is the Linux/Raspberry Pi bit-bang path that
+            # succeeds with this hardware.
+            self.sensor = adafruit_dht.DHT22(
+                self.pin,
+                use_pulseio=False,
+            )
             self.consecutive_failures = 0
-            log("DHT22 initialized on GPIO4")
+            log(f"{self.label} hardware interface initialized")
             return True
         except Exception as exc:
             self.sensor = None
-            log(f"DHT22 initialization failed: {exc}", "ERROR")
+            log(f"{self.label} initialization failed: {exc}", "ERROR")
             return False
 
+    def initialize(self):
+        """Initialize/reinitialize only the hardware interface.
+
+        The background sampling thread, if already running, is left intact.
+        """
+        with self._sensor_lock:
+            return self._initialize_sensor_locked()
+
+    def _start_background_sampler(self):
+        if self._sampler_thread is not None and self._sampler_thread.is_alive():
+            return
+
+        self._stop_event.clear()
+        self._sampler_thread = threading.Thread(
+            target=self._sampler_loop,
+            name=f"dht22-gpio{self.gpio}",
+            daemon=True,
+        )
+        self._sampler_thread.start()
+
     def close(self):
-        if self.sensor is not None:
-            try:
-                self.sensor.exit()
-            except Exception as exc:
-                log(f"DHT22 cleanup warning: {exc}", "WARNING")
-        self.sensor = None
+        """Stop background acquisition and release the DHT interface."""
+        self._stop_event.set()
 
-    def read_once(self):
-        """Perform at most one DHT transaction; caller controls the cadence."""
-        if self.sensor is None and not self.initialize():
-            return math.nan, math.nan, False
+        thread = self._sampler_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=max(3.0, DHT_PHYSICAL_POLL_INTERVAL_S + 1.0))
 
-        now = time.monotonic()
-        if self.last_attempt_monotonic is not None:
-            elapsed = now - self.last_attempt_monotonic
-            if elapsed < DHT_POLL_INTERVAL_S:
-                # This is a programming/scheduler guard.  Never defeat the
-                # cadence merely because another code path asks for data.
-                log(
-                    f"DHT22 read suppressed: only {elapsed:.2f}s since previous attempt",
-                    "WARNING",
+        self._sampler_thread = None
+
+        with self._sensor_lock:
+            self._close_sensor_locked()
+
+    def _append_attempt(self, timestamp, temperature, humidity):
+        with self._buffer_lock:
+            self._attempt_buffer.append(
+                (
+                    float(timestamp),
+                    float(temperature),
+                    float(humidity),
                 )
-                return math.nan, math.nan, False
+            )
 
-        self.last_attempt_monotonic = now
+    def _physical_sample(self):
+        """Perform exactly one physical DHT transaction and buffer its result.
 
-        try:
-            temperature = safe_float(self.sensor.temperature)
-            humidity = safe_float(self.sensor.humidity)
+        A failed attempt always appends NaN/NaN, which is intentional: failures
+        must consume buffer positions so stale measurements disappear naturally.
+        """
+        started = None
+        temperature = math.nan
+        humidity = math.nan
+        success = False
+        error = None
 
-            if not is_finite(temperature) or not is_finite(humidity):
-                raise RuntimeError("DHT22 returned non-finite data")
-            if not (-40.0 <= temperature <= 80.0):
-                raise RuntimeError(f"DHT22 temperature out of range: {temperature}")
-            if not (0.0 <= humidity <= 100.0):
-                raise RuntimeError(f"DHT22 humidity out of range: {humidity}")
+        # Serialise the actual timing-sensitive bit-banged transaction across
+        # all DHT workers. The workers still poll independently; this only
+        # prevents two GPIO transactions from overlapping by accident.
+        with DHT_PHYSICAL_IO_LOCK:
+            # Timestamp the actual transaction, not time spent waiting for the
+            # shared DHT I/O lock.
+            started = time.monotonic()
+            with self._sensor_lock:
+                if self.sensor is None:
+                    if not self._initialize_sensor_locked():
+                        error = "hardware interface unavailable"
 
-            self.consecutive_failures = 0
-            self.last_good = (temperature, humidity)
-            self.last_good_monotonic = time.monotonic()
-            log(f"DHT22 read OK: {temperature:.1f} C, {humidity:.1f} %")
-            return temperature, humidity, True
+                if self.sensor is not None:
+                    try:
+                        temperature = safe_float(self.sensor.temperature)
+                        humidity = safe_float(self.sensor.humidity)
 
-        except RuntimeError as exc:
-            # Checksum/full-buffer errors are expected transient failure modes
-            # for this sensor.  They are logged, not allowed to kill the daemon.
-            self.consecutive_failures += 1
+                        if not is_finite(temperature) or not is_finite(humidity):
+                            raise RuntimeError("DHT22 returned non-finite data")
+                        if not (-40.0 <= temperature <= 80.0):
+                            raise RuntimeError(
+                                f"DHT22 temperature out of range: {temperature}"
+                            )
+                        if not (0.0 <= humidity <= 100.0):
+                            raise RuntimeError(
+                                f"DHT22 humidity out of range: {humidity}"
+                            )
+
+                        success = True
+                        self.consecutive_failures = 0
+                        self.last_good = (temperature, humidity)
+                        self.last_good_monotonic = time.monotonic()
+
+                    except Exception as exc:
+                        error = exc
+                        self.consecutive_failures += 1
+
+                        if (
+                            self.consecutive_failures
+                            >= DHT_REINITIALIZE_AFTER_FAILURES
+                        ):
+                            log(
+                                f"{self.label} has failed "
+                                f"{self.consecutive_failures} consecutive physical "
+                                "reads; reinitializing interface",
+                                "ERROR",
+                            )
+                            self._initialize_sensor_locked()
+        finished = time.monotonic()
+        if started is None:
+            started = finished
+        sample_time = 0.5 * (started + finished)
+        self.last_attempt_monotonic = sample_time
+
+        if success:
+            self._append_attempt(sample_time, temperature, humidity)
+        else:
+            # Every failed physical attempt occupies a buffer position.
+            self._append_attempt(sample_time, math.nan, math.nan)
             log(
-                f"DHT22 transient read failure "
-                f"({self.consecutive_failures} consecutive): {exc}",
+                f"{self.label} physical read failed; buffered NaN "
+                f"({self.consecutive_failures} consecutive): {error}",
                 "WARNING",
             )
-        except Exception as exc:
-            self.consecutive_failures += 1
-            log(
-                f"DHT22 unexpected read failure "
-                f"({self.consecutive_failures} consecutive): {exc}",
-                "ERROR",
+
+        return success
+
+    def _sampler_loop(self):
+        """Continuously sample this physical DHT at the safe sensor cadence."""
+        # Slightly offset multiple DHT workers so their timing-sensitive
+        # bit-banged transactions do not normally start at the same instant.
+        initial_delay = max(
+            0.0,
+            (self.sensor_index - 1) * DHT_SENSOR_START_STAGGER_S,
+        )
+        if self._stop_event.wait(initial_delay):
+            return
+
+        next_attempt = time.monotonic()
+
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            wait_s = next_attempt - now
+            if wait_s > 0:
+                if self._stop_event.wait(wait_s):
+                    break
+
+            attempt_started = time.monotonic()
+            self._physical_sample()
+
+            # Keep starts approximately DHT_PHYSICAL_POLL_INTERVAL_S apart.
+            # If a transaction or OS scheduling delay overruns the interval,
+            # schedule from "now" instead of trying to catch up with a burst.
+            next_attempt += DHT_PHYSICAL_POLL_INTERVAL_S
+            now = time.monotonic()
+            if next_attempt <= now:
+                next_attempt = now + DHT_PHYSICAL_POLL_INTERVAL_S
+
+            # Defensive guard against an accidental zero/negative interval.
+            if next_attempt <= attempt_started:
+                next_attempt = (
+                    attempt_started + DHT_PHYSICAL_POLL_INTERVAL_S
+                )
+
+    def rolling_health(self):
+        """Return (attempt_count, valid_count) for power-reset decisions."""
+        with self._buffer_lock:
+            attempts = list(self._attempt_buffer)
+        valid = sum(
+            1
+            for _timestamp, temperature, humidity in attempts
+            if is_finite(temperature) and is_finite(humidity)
+        )
+        return len(attempts), valid
+
+    def restart_after_power_cycle(self):
+        """Clear stale state, recreate the DHT object, and restart sampling."""
+        with self._buffer_lock:
+            self._attempt_buffer.clear()
+
+        self.consecutive_failures = 0
+        self.last_attempt_monotonic = None
+        self.last_good = (math.nan, math.nan)
+        self.last_good_monotonic = None
+
+        initialized = self.initialize()
+        self._start_background_sampler()
+        return initialized
+
+    @staticmethod
+    def _linear_interpolate(x0, y0, x1, y1, x):
+        if x1 <= x0:
+            return float(y0)
+        fraction = (x - x0) / (x1 - x0)
+        return float(y0 + fraction * (y1 - y0))
+
+    @staticmethod
+    def _pchip_slopes(xs, ys):
+        """Return Fritsch-Carlson/PCHIP first derivatives.
+
+        This small implementation avoids adding SciPy as a runtime dependency on
+        the Raspberry Pi while retaining the no-overshoot behaviour wanted for
+        slowly varying temperature/humidity data.
+        """
+        n = len(xs)
+        if n < 2:
+            return [0.0] * n
+
+        h = [xs[i + 1] - xs[i] for i in range(n - 1)]
+        delta = [
+            (ys[i + 1] - ys[i]) / h[i]
+            if h[i] > 0
+            else 0.0
+            for i in range(n - 1)
+        ]
+
+        if n == 2:
+            return [delta[0], delta[0]]
+
+        slopes = [0.0] * n
+
+        # Interior derivatives: weighted harmonic mean when neighboring secant
+        # slopes have the same sign; zero at a local extremum/flat transition.
+        for i in range(1, n - 1):
+            d_left = delta[i - 1]
+            d_right = delta[i]
+
+            if (
+                d_left == 0.0
+                or d_right == 0.0
+                or (d_left > 0.0) != (d_right > 0.0)
+            ):
+                slopes[i] = 0.0
+            else:
+                w1 = 2.0 * h[i] + h[i - 1]
+                w2 = h[i] + 2.0 * h[i - 1]
+                slopes[i] = (w1 + w2) / (
+                    (w1 / d_left) + (w2 / d_right)
+                )
+
+        def endpoint_slope(h0, h1, d0, d1):
+            slope = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
+
+            if slope == 0.0:
+                return 0.0
+
+            if (slope > 0.0) != (d0 > 0.0):
+                return 0.0
+
+            if (
+                (d0 > 0.0) != (d1 > 0.0)
+                and abs(slope) > 3.0 * abs(d0)
+            ):
+                return 3.0 * d0
+
+            return slope
+
+        slopes[0] = endpoint_slope(
+            h[0],
+            h[1],
+            delta[0],
+            delta[1],
+        )
+        slopes[-1] = endpoint_slope(
+            h[-1],
+            h[-2],
+            delta[-1],
+            delta[-2],
+        )
+
+        return slopes
+
+    @classmethod
+    def _pchip_interpolate(cls, xs, ys, target):
+        """Evaluate shape-preserving cubic Hermite interpolation at target."""
+        n = len(xs)
+        if n == 1:
+            return float(ys[0])
+        if n == 2:
+            return cls._linear_interpolate(
+                xs[0], ys[0], xs[1], ys[1], target
             )
 
-        if self.consecutive_failures >= DHT_REINITIALIZE_AFTER_FAILURES:
-            log(
-                f"DHT22 has failed {self.consecutive_failures} consecutive reads; "
-                "reinitializing interface",
-                "ERROR",
-            )
-            self.initialize()
+        # Exact sample time: preserve the actual observation exactly.
+        for x, y in zip(xs, ys):
+            if target == x:
+                return float(y)
 
-        return math.nan, math.nan, False
+        interval = None
+        for i in range(n - 1):
+            if xs[i] <= target <= xs[i + 1]:
+                interval = i
+                break
+
+        if interval is None:
+            raise ValueError("PCHIP target lies outside sample range")
+
+        slopes = cls._pchip_slopes(xs, ys)
+
+        i = interval
+        x0 = xs[i]
+        x1 = xs[i + 1]
+        h = x1 - x0
+        if h <= 0:
+            return float(ys[i])
+
+        t = (target - x0) / h
+        t2 = t * t
+        t3 = t2 * t
+
+        h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+        h10 = t3 - 2.0 * t2 + t
+        h01 = -2.0 * t3 + 3.0 * t2
+        h11 = t3 - t2
+
+        return float(
+            h00 * ys[i]
+            + h10 * h * slopes[i]
+            + h01 * ys[i + 1]
+            + h11 * h * slopes[i + 1]
+        )
+
+    @classmethod
+    def _estimate_channel(cls, points, target):
+        """Estimate one channel at target without ever extrapolating.
+
+        points is a sequence of (timestamp, value) pairs already filtered to
+        finite values.
+        """
+        if not points:
+            return math.nan, "none"
+
+        points = sorted(points, key=lambda item: item[0])
+
+        # Guard against duplicate timestamps, keeping the newest value for an
+        # exact timestamp. Duplicates are unlikely with monotonic time but this
+        # keeps interpolation numerically well-defined.
+        deduplicated = []
+        for timestamp, value in points:
+            if deduplicated and timestamp == deduplicated[-1][0]:
+                deduplicated[-1] = (timestamp, value)
+            else:
+                deduplicated.append((timestamp, value))
+        points = deduplicated
+
+        if len(points) == 1:
+            return float(points[0][1]), "single-point"
+
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+
+        # Never extrapolate. The 2.1-s look-back normally ensures that target is
+        # bracketed; if recent attempts failed, use the nearest actual reading.
+        if target < xs[0] or target > xs[-1]:
+            nearest = min(points, key=lambda item: abs(item[0] - target))
+            return float(nearest[1]), "nearest-no-extrapolation"
+
+        if len(points) == 2:
+            return (
+                cls._linear_interpolate(
+                    xs[0], ys[0], xs[1], ys[1], target
+                ),
+                "linear",
+            )
+
+        return cls._pchip_interpolate(xs, ys, target), "pchip"
+
+    def read_once(self):
+        """Return one logical DHT reading from the rolling physical buffer.
+
+        This preserves the old external interface:
+            (temperature, humidity, ok)
+
+        No DHT transaction occurs here.
+        """
+        request_time = time.monotonic()
+        target_time = request_time - DHT_INTERPOLATION_LOOKBACK_S
+
+        with self._buffer_lock:
+            attempts = list(self._attempt_buffer)
+
+        valid = [
+            (timestamp, temperature, humidity)
+            for timestamp, temperature, humidity in attempts
+            if is_finite(temperature) and is_finite(humidity)
+        ]
+
+        if not valid:
+            log(
+                f"{self.label} logical read unavailable: "
+                f"0/{len(attempts)} valid physical attempts in rolling buffer",
+                "WARNING",
+            )
+            return math.nan, math.nan, False
+
+        temperature_points = [
+            (timestamp, temperature)
+            for timestamp, temperature, _humidity in valid
+        ]
+        humidity_points = [
+            (timestamp, humidity)
+            for timestamp, _temperature, humidity in valid
+        ]
+
+        temperature, temperature_method = self._estimate_channel(
+            temperature_points,
+            target_time,
+        )
+        humidity, humidity_method = self._estimate_channel(
+            humidity_points,
+            target_time,
+        )
+
+        if not is_finite(temperature) or not is_finite(humidity):
+            log(
+                f"{self.label} logical interpolation returned non-finite data",
+                "WARNING",
+            )
+            return math.nan, math.nan, False
+
+        self.last_good = (temperature, humidity)
+        self.last_good_monotonic = target_time
+
+        method = (
+            temperature_method
+            if temperature_method == humidity_method
+            else f"T={temperature_method},RH={humidity_method}"
+        )
+
+        log(
+            f"{self.label} logical read: {temperature:.2f} C, "
+            f"{humidity:.2f} % at t-"
+            f"{DHT_INTERPOLATION_LOOKBACK_S:.1f}s; "
+            f"{len(valid)}/{len(attempts)} valid attempts; method={method}"
+        )
+
+        return temperature, humidity, True
 
 
 # -----------------------------------------------------------------------------
-# BME680
+# BME280
 # -----------------------------------------------------------------------------
 
-class BME680Reader:
-    """Fault-tolerant BME680 reader for I2C temperature/RH/pressure/gas."""
+class BME280Reader:
+    """Fault-tolerant BME280 reader for I2C temperature/RH/pressure."""
 
-    def __init__(self, address=BME680_I2C_ADDRESS):
+    def __init__(self, address=BME280_I2C_ADDRESS):
         self.address = address
+        self.enabled = address is not None
         self.i2c = None
         self.sensor = None
         self.consecutive_failures = 0
         self.last_attempt_monotonic = None
-        self.last_good = (math.nan, math.nan, math.nan, math.nan, math.nan)
+        self.last_good = (math.nan, math.nan, math.nan, math.nan)
         self.last_good_monotonic = None
         self.initialize()
 
@@ -514,19 +1391,26 @@ class BME680Reader:
     def initialize(self):
         self.close()
 
-        if adafruit_bme680 is None:
-            log(f"BME680 library unavailable: {BME680_IMPORT_ERROR}", "ERROR")
+        if not self.enabled:
+            return False
+
+        if adafruit_bme280 is None:
+            log(
+                f"BME280 library unavailable: {BME280_IMPORT_ERROR}. "
+                "Install adafruit-circuitpython-bme280.",
+                "ERROR",
+            )
             return False
 
         try:
             self.i2c = board.I2C()
-            self.sensor = adafruit_bme680.Adafruit_BME680_I2C(
+            self.sensor = adafruit_bme280.Adafruit_BME280_I2C(
                 self.i2c,
                 address=self.address,
             )
-            self.sensor.sea_level_pressure = BME680_SEA_LEVEL_PRESSURE_HPA
+            self.sensor.sea_level_pressure = BME280_SEA_LEVEL_PRESSURE_HPA
             self.consecutive_failures = 0
-            log(f"BME680 initialized on I2C address 0x{self.address:02x}")
+            log(f"BME280 initialized on I2C address 0x{self.address:02x}")
             return True
         except Exception as exc:
             self.sensor = None
@@ -536,7 +1420,7 @@ class BME680Reader:
                 except Exception:
                     pass
             self.i2c = None
-            log(f"BME680 initialization failed: {exc}", "ERROR")
+            log(f"BME280 initialization failed: {exc}", "ERROR")
             return False
 
     def close(self):
@@ -545,7 +1429,7 @@ class BME680Reader:
             try:
                 self.i2c.deinit()
             except Exception as exc:
-                log(f"BME680 I2C cleanup warning: {exc}", "WARNING")
+                log(f"BME280 I2C cleanup warning: {exc}", "WARNING")
         self.i2c = None
 
     @staticmethod
@@ -560,24 +1444,23 @@ class BME680Reader:
     def _validate_pressure(value):
         return value if is_finite(value) and 300.0 <= value <= 1100.0 else math.nan
 
-    @staticmethod
-    def _validate_gas(value):
-        return value if is_finite(value) and value > 0.0 else math.nan
-
     def read_once(self):
-        """Perform one BME680 sample; caller controls the cadence."""
+        """Perform one BME280 sample; caller controls the cadence."""
+        if not self.enabled:
+            return math.nan, math.nan, math.nan, math.nan, False
+
         if self.sensor is None and not self.initialize():
             return (*self.last_good, False)
 
         now = time.monotonic()
         if self.last_attempt_monotonic is not None:
             elapsed = now - self.last_attempt_monotonic
-            if elapsed < BME680_POLL_INTERVAL_S:
+            if elapsed < BME280_POLL_INTERVAL_S:
                 log(
-                    f"BME680 read suppressed: only {elapsed:.2f}s since previous attempt",
+                    f"BME280 read suppressed: only {elapsed:.2f}s since previous attempt",
                     "WARNING",
                 )
-                return math.nan, math.nan, math.nan, math.nan, math.nan, False
+                return math.nan, math.nan, math.nan, math.nan, False
 
         self.last_attempt_monotonic = now
 
@@ -585,47 +1468,41 @@ class BME680Reader:
             temperature = self._validate_temperature(safe_float(self.sensor.temperature))
             humidity = self._validate_humidity(safe_float(self.sensor.relative_humidity))
             pressure = self._validate_pressure(safe_float(self.sensor.pressure))
-            gas = self._validate_gas(safe_float(self.sensor.gas))
             altitude = safe_float(self.sensor.altitude)
             if not is_finite(altitude):
                 altitude = math.nan
 
-            # Temperature, humidity and pressure are the core environmental
-            # channels. Gas resistance is retained even during its burn-in, but
-            # a temporarily invalid gas value does not discard an otherwise good
-            # BME680 sample.
             if not all(is_finite(v) for v in (temperature, humidity, pressure)):
                 raise RuntimeError(
-                    f"BME680 returned invalid core data: "
+                    f"BME280 returned invalid core data: "
                     f"T={temperature}, RH={humidity}, P={pressure}"
                 )
 
             self.consecutive_failures = 0
-            self.last_good = (temperature, humidity, pressure, gas, altitude)
+            self.last_good = (temperature, humidity, pressure, altitude)
             self.last_good_monotonic = time.monotonic()
             log(
-                f"BME680 read OK: {temperature:.2f} C, {humidity:.2f} %, "
-                f"{pressure:.2f} hPa, gas={gas:.0f} ohm, altitude={altitude:.2f} m"
+                f"BME280 read OK: {temperature:.2f} C, {humidity:.2f} %, "
+                f"{pressure:.2f} hPa, altitude={altitude:.2f} m"
             )
-            return temperature, humidity, pressure, gas, altitude, True
+            return temperature, humidity, pressure, altitude, True
 
         except Exception as exc:
             self.consecutive_failures += 1
             log(
-                f"BME680 read failure ({self.consecutive_failures} consecutive): {exc}",
+                f"BME280 read failure ({self.consecutive_failures} consecutive): {exc}",
                 "WARNING",
             )
 
-        if self.consecutive_failures >= BME680_REINITIALIZE_AFTER_FAILURES:
+        if self.consecutive_failures >= BME280_REINITIALIZE_AFTER_FAILURES:
             log(
-                f"BME680 has failed {self.consecutive_failures} consecutive reads; "
+                f"BME280 has failed {self.consecutive_failures} consecutive reads; "
                 "reinitializing I2C interface",
                 "ERROR",
             )
             self.initialize()
 
-        return math.nan, math.nan, math.nan, math.nan, math.nan, False
-
+        return math.nan, math.nan, math.nan, math.nan, False
 
 def combine_two_sensor_values(
     first_value,
@@ -657,7 +1534,7 @@ def combine_ambient_temperatures(dht_temperature_c, bme_temperature_c):
         dht_temperature_c,
         bme_temperature_c,
         first_name="DHT22",
-        second_name="BME680",
+        second_name="BME280",
         disagreement_threshold=TEMPERATURE_DISAGREEMENT_WARN_C,
         unit="C",
     )
@@ -668,7 +1545,7 @@ def combine_ambient_humidities(dht_humidity_percent, bme_humidity_percent):
         dht_humidity_percent,
         bme_humidity_percent,
         first_name="DHT22",
-        second_name="BME680",
+        second_name="BME280",
         disagreement_threshold=HUMIDITY_DISAGREEMENT_WARN_PERCENT,
         unit="percentage points",
     )
@@ -693,7 +1570,7 @@ class CameraManager:
     Capture flow:
       1. Start in AE/AWB mode and meter the scene.
       2. Select DAY / TWILIGHT / NIGHT with hysteresis.
-      3. DAY: normal colour + failed-IR-cut correction in post-processing.
+      3. DAY: fixed calibrated NoIR ColourGains/CCM/Saturation in libcamera.
       4. TWILIGHT: AE/AWB + low saturation; no fake colour reconstruction.
       5. NIGHT: restart with manual long exposure/high gain, monochrome,
          high-quality noise reduction where supported, and average 3-4 frames.
@@ -841,7 +1718,24 @@ class CameraManager:
         return {
             "AeEnable": True,
             "AwbEnable": True,
-            "Saturation": CAMERA_DAY_SATURATION,
+            "Saturation": CAMERA_METER_SATURATION,
+            "Contrast": 1.0,
+            "Sharpness": 1.1,
+            "ExposureValue": 0.0,
+            "NoiseReductionMode": self._hq_noise_reduction_value(),
+        }
+
+    def _day_controls(self):
+        """Return the tested IMX477 NoIR daylight calibration."""
+        return {
+            "AeEnable": True,
+            "AwbEnable": False,
+            "ColourGains": (
+                CAMERA_DAY_NOIR_RED_GAIN,
+                CAMERA_DAY_NOIR_BLUE_GAIN,
+            ),
+            "ColourCorrectionMatrix": CAMERA_DAY_NOIR_CCM,
+            "Saturation": CAMERA_DAY_NOIR_SATURATION,
             "Contrast": 1.0,
             "Sharpness": 1.1,
             "ExposureValue": 0.0,
@@ -1159,69 +2053,6 @@ class CameraManager:
                     log(f"Could not remove temporary night frame {path}: {exc}", "WARNING")
 
 
-    @staticmethod
-    def _postprocess_image(image_path, mode):
-        """Apply daylight IR colour compensation after camera-side rotation."""
-        needs_colour = CAMERA_IR_CUT_COMPENSATION and mode == "day"
-
-        if not needs_colour:
-            return True
-
-        if Image is None:
-            log(
-                f"Image post-processing unavailable (Pillow import failed: "
-                f"{PIL_IMPORT_ERROR}); retaining unprocessed image",
-                "ERROR",
-            )
-            return False
-
-        temp_path = f"{image_path}.postprocess.tmp"
-        try:
-            with Image.open(image_path) as opened:
-                image = opened.convert("RGB")
-
-                if needs_colour:
-                    image = image.convert("RGB", CAMERA_IR_COLOUR_MATRIX)
-                    if CAMERA_DAY_POST_SATURATION < 1.0:
-                        grayscale = image.convert("L").convert("RGB")
-                        image = Image.blend(
-                            grayscale, image, CAMERA_DAY_POST_SATURATION
-                        )
-
-                image.save(
-                    temp_path,
-                    format="JPEG",
-                    quality=CAMERA_JPEG_QUALITY,
-                    optimize=True,
-                )
-
-            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                raise RuntimeError("post-processed JPEG is empty")
-
-            os.replace(temp_path, image_path)
-            actions = []
-            if needs_colour:
-                actions.append("IR-cut daylight colour compensation + false-colour suppression")
-            if mode == "twilight":
-                actions.append("twilight low-saturation profile")
-            if mode == "night":
-                actions.append("night monochrome stack")
-            log(f"Applied {' + '.join(actions)} to {image_path}")
-            return True
-
-        except Exception as exc:
-            log(
-                f"Image post-processing failed for {image_path}: {exc}; "
-                "retaining original capture",
-                "ERROR",
-            )
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-            return False
-
     def capture(self):
         """Capture one best-effort day/twilight/night image."""
         if self.camera is None and not self.initialize():
@@ -1258,7 +2089,20 @@ class CameraManager:
             image_path = os.path.join(IMAGE_DIR, f"{stamp}.jpg")
 
             if mode == "day":
-                # Already in the appropriate auto profile; capture immediately.
+                # Metering deliberately used normal AE/AWB. For the final DAY
+                # JPEG, switch to the fixed NoIR calibration tested live with
+                # rpicam-vid: ColourGains=(0.90, 1.30), Saturation=1.40, and
+                # CCM=(1.35,-0.25,-0.10,-0.15,1.30,-0.15,-0.10,-0.25,1.35).
+                self._set_controls(self._day_controls(), "day NoIR calibration")
+                for frame in range(1, CAMERA_DAY_CONTROL_SETTLE_FRAMES + 1):
+                    settled = camera.capture_metadata()
+                    log(
+                        f"Day NoIR settle frame {frame}/"
+                        f"{CAMERA_DAY_CONTROL_SETTLE_FRAMES}: "
+                        f"ColourGains={settled.get('ColourGains')}, "
+                        f"exposure={safe_float(settled.get('ExposureTime')):.0f} us, "
+                        f"gain={safe_float(settled.get('AnalogueGain')):.3f}"
+                    )
                 camera.capture_file(image_path)
 
             elif mode == "twilight":
@@ -1293,8 +2137,6 @@ class CameraManager:
             if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
                 raise RuntimeError(f"camera produced an empty image: {image_path}")
 
-            self._postprocess_image(image_path, mode=mode)
-
             log(
                 f"Saved {mode.upper()} image: {image_path} "
                 f"({os.path.getsize(image_path)} bytes)"
@@ -1320,20 +2162,42 @@ class CameraManager:
 # Local data collection
 # -----------------------------------------------------------------------------
 
-def write_data_block(dht_samples, bme_samples, camera_manager):
-    """Aggregate current samples and append one weather/system row."""
-    dht_temperature = median_or_nan([sample[0] for sample in dht_samples])
-    dht_humidity = median_or_nan([sample[1] for sample in dht_samples])
+def write_data_block(dht_sample_map, bme_samples, camera_manager):
+    """Aggregate current samples and append one weather/system row.
+
+    dht_sample_map is keyed by BCM GPIO so every discovered DHT remains
+    independently visible.  The historical DHT22_* columns are the ensemble of
+    the individual DHT block medians.
+    """
+    dht_summaries = []
+    dht_detail_values = []
+
+    for gpio in DHT_GPIOS:
+        samples = list(dht_sample_map.get(gpio, ()))
+        temperature = median_or_nan([sample[0] for sample in samples])
+        humidity = median_or_nan([sample[1] for sample in samples])
+        dht_summaries.append(
+            {
+                "gpio": gpio,
+                "temperature": temperature,
+                "humidity": humidity,
+                "count": len(samples),
+            }
+        )
+        dht_detail_values.extend([gpio, temperature, humidity])
+
+    dht_temperature = median_or_nan(
+        [entry["temperature"] for entry in dht_summaries]
+    )
+    dht_humidity = median_or_nan(
+        [entry["humidity"] for entry in dht_summaries]
+    )
 
     bme_temperature = median_or_nan([sample[0] for sample in bme_samples])
     bme_humidity = median_or_nan([sample[1] for sample in bme_samples])
     bme_pressure = median_or_nan([sample[2] for sample in bme_samples])
-    bme_gas = median_or_nan([sample[3] for sample in bme_samples])
-    bme_altitude = median_or_nan([sample[4] for sample in bme_samples])
+    bme_altitude = median_or_nan([sample[3] for sample in bme_samples])
 
-    # Candidate combined channels: equal-weight mean of the two independent
-    # block medians.  Keep these separate from Ambient_* until the comparison
-    # has shown that averaging the BME680 with the DHT22 is actually desirable.
     combined_temperature = combine_ambient_temperatures(
         dht_temperature,
         bme_temperature,
@@ -1343,8 +2207,6 @@ def write_data_block(dht_samples, bme_samples, camera_manager):
         bme_humidity,
     )
 
-    # Version-2 evaluation policy: DHT22 remains the default public/ambient
-    # reading, but BME680 takes over automatically if the DHT22 is unavailable.
     ambient_temperature = primary_with_fallback(dht_temperature, bme_temperature)
     ambient_humidity = primary_with_fallback(dht_humidity, bme_humidity)
 
@@ -1361,10 +2223,10 @@ def write_data_block(dht_samples, bme_samples, camera_manager):
             combined_humidity,
             dht_temperature,
             dht_humidity,
+            *dht_detail_values,
             bme_temperature,
             bme_humidity,
             bme_pressure,
-            bme_gas,
             bme_altitude,
             camera_lux,
             camera_lux_age,
@@ -1391,22 +2253,44 @@ def write_data_block(dht_samples, bme_samples, camera_manager):
 
     log("-----------------------------------------")
     log(f"Data block logged at {timestamp}")
-    log(f"DHT22 valid samples in block: {len(dht_samples)}")
-    log(f"DHT22 median: {dht_temperature:.2f} C, {dht_humidity:.2f} %")
-    log(f"BME680 valid samples in block: {len(bme_samples)}")
-    log(
-        f"BME680 median: {bme_temperature:.2f} C, {bme_humidity:.2f} %, "
-        f"{bme_pressure:.2f} hPa, gas={bme_gas:.0f} ohm, "
-        f"altitude={bme_altitude:.2f} m"
-    )
+
+    if dht_summaries:
+        for index, entry in enumerate(dht_summaries, start=1):
+            log(
+                f"DHT22[{index}] GPIO{entry['gpio']}: "
+                f"{entry['count']} valid samples; median "
+                f"{entry['temperature']:.2f} C, {entry['humidity']:.2f} %"
+            )
+        log(
+            f"DHT ensemble: {dht_temperature:.2f} C, "
+            f"{dht_humidity:.2f} % RH"
+        )
+    else:
+        log("No DHT22 sensors configured", "WARNING")
+
+    if BME280_I2C_ADDRESS is None:
+        log("BME280 disabled/not discovered")
+    else:
+        log(f"BME280 valid samples in block: {len(bme_samples)}")
+        log(
+            f"BME280 median: {bme_temperature:.2f} C, {bme_humidity:.2f} %, "
+            f"{bme_pressure:.2f} hPa, altitude={bme_altitude:.2f} m"
+        )
+
     log(
         f"Combined candidate: {combined_temperature:.2f} C, "
         f"{combined_humidity:.2f} % RH"
     )
+    source = (
+        "DHT ensemble"
+        if is_finite(dht_temperature)
+        else "BME280 fallback"
+        if is_finite(bme_temperature)
+        else "unavailable"
+    )
     log(
         f"Current Ambient_* default: {ambient_temperature:.2f} C, "
-        f"{ambient_humidity:.2f} % RH "
-        f"({'DHT22' if is_finite(dht_temperature) else 'BME680 fallback' if is_finite(bme_temperature) else 'unavailable'})"
+        f"{ambient_humidity:.2f} % RH ({source})"
     )
     log(f"Camera lux: {camera_lux:.2f} (age {camera_lux_age:.1f} s)")
     log(f"CPU: {cpu_temp:.2f} C, {cpu_usage:.1f} %, RAM {memory_usage:.1f} %")
@@ -1427,7 +2311,6 @@ def scp_with_retries(local_path, remote_spec):
             result = subprocess.run(
                 [
                     "scp",
-                    "-v",  # retained intentionally: diagnostic evidence matters
                     "-l", SCP_BANDWIDTH_LIMIT_KBIT_S,
                     "-o", f"ConnectTimeout={SCP_CONNECT_TIMEOUT_S}",
                     local_path,
@@ -1461,14 +2344,8 @@ def scp_with_retries(local_path, remote_spec):
     return False
 
 
-def send_data(camera_manager):
-    """Transfer telemetry first, then capture/upload only the current image.
-
-    Robustness rule: historical image backlog must never delay weather/system
-    telemetry. Existing older images remain untouched in IMAGE_DIR for explicit
-    manual recovery or archival. Returns (weather_csv_uploaded,
-    system_csv_uploaded).
-    """
+def send_data():
+    """Transfer telemetry first, then drain a bounded slice of image backlog."""
     log("Beginning transfer phase")
 
     # Environmental/system telemetry is the primary product. Send it before
@@ -1491,60 +2368,38 @@ def send_data(camera_manager):
             "ERROR",
         )
 
-    # Capture one image for this cycle only. Older images are deliberately not
-    # swept here; they must not turn a five-minute telemetry cycle into a long
-    # backlog-draining job.
-    image_path = camera_manager.capture()
-    if image_path is None:
-        log("No new image available for upload this cycle", "WARNING")
-    else:
-        if scp_with_retries(image_path, f"{SERVER_ADDRESS}:{SERVER_IMAGE_DIR}"):
+    # Only start backlog work when both primary telemetry streams reached the
+    # server.  The per-cycle cap prevents months of images from blocking fresh
+    # measurements after reconnection; repeated cycles eventually drain all of
+    # them, oldest first.
+    backlog = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg")))
+    transferred = 0
+    if weather_ok and system_ok:
+        for image_path in backlog[:IMAGE_BACKLOG_UPLOADS_PER_CYCLE]:
+            if not scp_with_retries(
+                image_path, f"{SERVER_ADDRESS}:{SERVER_IMAGE_DIR}"
+            ):
+                break
             try:
                 os.remove(image_path)
-                log(f"Removed transferred current image: {image_path}")
+                transferred += 1
+                log(f"Removed transferred backlog image: {image_path}")
             except Exception as exc:
                 log(
-                    f"Current image reached server but local cleanup failed "
+                    f"Image reached server but local cleanup failed "
                     f"for {image_path}: {exc}",
                     "WARNING",
                 )
-        else:
-            log(
-                f"Preserving current image locally after failed transfer: {image_path}",
-                "ERROR",
-            )
 
-    # Make any pre-existing backlog explicit in the log without touching it.
-    backlog = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.jpg")))
-    if backlog:
+    remaining = max(0, len(backlog) - transferred)
+    if remaining:
         log(
-            f"Historical/local image backlog retained: {len(backlog)} file(s). "
-            "Backlog does not block telemetry; transfer/archive it separately.",
+            f"Local image backlog: {remaining} file(s); transferred "
+            f"{transferred} this cycle",
             "WARNING",
         )
 
     return weather_ok, system_ok
-
-
-def clear_uploaded_csvs(weather_uploaded, system_uploaded):
-    """Clear only files known to have reached the server successfully."""
-    if weather_uploaded:
-        try:
-            write_csv_header(LOCAL_WEATHER_CSV, WEATHER_HEADER)
-            log("Cleared local weather CSV after confirmed upload")
-        except Exception as exc:
-            log(f"Could not clear local weather CSV: {exc}", "ERROR")
-    else:
-        log("Weather CSV not cleared because upload was not confirmed", "WARNING")
-
-    if system_uploaded:
-        try:
-            write_csv_header(LOCAL_SYSTEM_CSV, SYSTEM_HEADER)
-            log("Cleared local system CSV after confirmed upload")
-        except Exception as exc:
-            log(f"Could not clear local system CSV: {exc}", "ERROR")
-    else:
-        log("System CSV not cleared because upload was not confirmed", "WARNING")
 
 
 # -----------------------------------------------------------------------------
@@ -1554,46 +2409,137 @@ def clear_uploaded_csvs(weather_uploaded, system_uploaded):
 def main():
     ensure_paths()
 
-    dht = DHT22Reader(DHT_PIN)
-    bme = BME680Reader(BME680_I2C_ADDRESS)
+    # GPIO17 / physical pin 11 is now the DHT supply.  Force it high before
+    # constructing the Adafruit DHT objects; after a Pi reboot this GPIO would
+    # otherwise begin as an input and both sensors would be unpowered.
+    ensure_dht_power_on(settle=True)
+
+    dht_readers = []
+    for index, gpio in enumerate(DHT_GPIOS, start=1):
+        pin = getattr(board, f"D{gpio}", None)
+        if pin is None:
+            log(f"Configured DHT22 GPIO{gpio} is unavailable in board module", "ERROR")
+            continue
+        dht_readers.append(DHT22Reader(pin, gpio, index))
+
+    bme = BME280Reader(BME280_I2C_ADDRESS)
     camera = CameraManager()
 
-    dht_samples = deque(maxlen=DHT_SAMPLE_BUFFER_SIZE)
-    bme_samples = deque(maxlen=BME680_SAMPLE_BUFFER_SIZE)
+    dht_samples = {
+        reader.gpio: deque(maxlen=DHT_SAMPLE_BUFFER_SIZE)
+        for reader in dht_readers
+    }
+    bme_samples = deque(maxlen=BME280_SAMPLE_BUFFER_SIZE)
 
     start = time.monotonic()
     next_dht_poll = start
     next_bme_poll = start
     next_data_log = start + DATA_LOG_INTERVAL_S
     next_upload = start + UPLOAD_INTERVAL_S
-    next_clear = (
-        start + LOCAL_CSV_CLEAR_INTERVAL_S
-        if LOCAL_CSV_CLEAR_INTERVAL_S is not None
-        else None
-    )
+    next_image_capture = start + UPLOAD_INTERVAL_S
+    next_retention_check = start + LOCAL_CSV_RETENTION_CHECK_INTERVAL_S
+    connectivity_state = load_connectivity_state()
+    last_policy_name = None
 
     last_upload_status = (False, False)
+    dht_power_failure_confirmations = 0
+    last_dht_power_reset_monotonic = -math.inf
 
     log("Weather Station Initialized! Harvesting data...")
-    log(
-        f"DHT22={'available' if dht.available else 'unavailable'}, "
-        f"BME680={'available' if bme.available else 'unavailable'} at 0x{BME680_I2C_ADDRESS:02x}, "
-        f"camera={'available' if camera.available else 'unavailable'}"
+    dht_status = ", ".join(
+        f"GPIO{reader.gpio}={'available' if reader.available else 'unavailable'}"
+        for reader in dht_readers
+    ) or "none configured"
+    bme_status = (
+        f"{'available' if bme.available else 'unavailable'} "
+        f"at 0x{BME280_I2C_ADDRESS:02x}"
+        if BME280_I2C_ADDRESS is not None
+        else "disabled/not discovered"
     )
     log(
-        f"Cadence: DHT poll={DHT_POLL_INTERVAL_S:.1f}s, "
-        f"BME680 poll={BME680_POLL_INTERVAL_S:.1f}s, "
-        f"data log={DATA_LOG_INTERVAL_S:.1f}s, upload={UPLOAD_INTERVAL_S:.1f}s"
+        f"DHT22 sensors: {dht_status}; "
+        f"BME280={bme_status}; "
+        f"camera={'available' if camera.available else 'unavailable'}"
+    )
+    log(f"Hardware configuration: {HARDWARE_CONFIG_PATH}")
+    if DHT_GPIOS:
+        log(
+            f"DHT switched VCC: GPIO{DHT_POWER_GPIO} / physical pin "
+            f"{DHT_POWER_PHYSICAL_PIN}; automatic cold-reset enabled"
+        )
+    log(
+        f"Cadence: DHT physical={DHT_PHYSICAL_POLL_INTERVAL_S:.1f}s, "
+        f"DHT logical={DHT_POLL_INTERVAL_S:.1f}s, "
+        f"DHT look-back={DHT_INTERPOLATION_LOOKBACK_S:.1f}s, "
+        f"BME280 poll={BME280_POLL_INTERVAL_S:.1f}s, "
+        f"data log={DATA_LOG_INTERVAL_S:.1f}s, upload={UPLOAD_INTERVAL_S:.1f}s; "
+        "adaptive offline store-and-forward enabled"
     )
 
     try:
         while True:
             now = time.monotonic()
+            policy, outage_seconds, free_percent = select_offline_policy(
+                connectivity_state
+            )
+            _minimum_outage, data_interval, image_interval, probe_interval, policy_name = policy
+            if policy_name != last_policy_name:
+                log(
+                    f"Storage/network policy: {policy_name}; outage="
+                    f"{outage_seconds / 3600.0:.1f} h; disk free="
+                    f"{free_percent:.1f}%; telemetry={data_interval:.0f}s; "
+                    f"images={image_interval:.0f}s; reconnect={probe_interval:.0f}s",
+                    "WARNING" if connectivity_state.get("offline_since_epoch") else "INFO",
+                )
+                last_policy_name = policy_name
 
             if now >= next_dht_poll:
-                temperature, humidity, ok = dht.read_once()
-                if ok:
-                    dht_samples.append((temperature, humidity))
+                for reader in dht_readers:
+                    temperature, humidity, ok = reader.read_once()
+                    if ok:
+                        dht_samples[reader.gpio].append((temperature, humidity))
+
+                # A true latch-up presents as a full rolling buffer of failed
+                # physical attempts on every DHT.  Confirm this on successive
+                # logical polls before touching power so ordinary checksum
+                # glitches remain handled by the interpolation layer.
+                if dht_readers:
+                    health = [reader.rolling_health() for reader in dht_readers]
+                    all_fully_dead = all(
+                        attempts >= DHT_ROLLING_ATTEMPTS and valid == 0
+                        for attempts, valid in health
+                    )
+
+                    if all_fully_dead:
+                        dht_power_failure_confirmations += 1
+                        health_text = ", ".join(
+                            f"GPIO{reader.gpio}={valid}/{attempts}"
+                            for reader, (attempts, valid) in zip(dht_readers, health)
+                        )
+                        log(
+                            f"DHT hard-failure confirmation "
+                            f"{dht_power_failure_confirmations}/"
+                            f"{DHT_POWER_RESET_CONFIRMATIONS}: {health_text}",
+                            "ERROR",
+                        )
+                    else:
+                        dht_power_failure_confirmations = 0
+
+                    since_reset = (
+                        time.monotonic() - last_dht_power_reset_monotonic
+                    )
+                    if (
+                        dht_power_failure_confirmations
+                        >= DHT_POWER_RESET_CONFIRMATIONS
+                        and since_reset >= DHT_POWER_RESET_COOLDOWN_S
+                    ):
+                        if power_cycle_dht_readers(dht_readers):
+                            # Do not let pre-reset logical samples survive into
+                            # the next 30-s aggregate block.
+                            for samples in dht_samples.values():
+                                samples.clear()
+                        last_dht_power_reset_monotonic = time.monotonic()
+                        dht_power_failure_confirmations = 0
 
                 # Advance from 'now', rather than repeatedly catching up after a
                 # long camera/SCP operation and accidentally bursting DHT reads.
@@ -1601,36 +2547,103 @@ def main():
 
             now = time.monotonic()
             if now >= next_bme_poll:
-                temperature, humidity, pressure, gas, altitude, ok = bme.read_once()
-                if ok:
-                    bme_samples.append((temperature, humidity, pressure, gas, altitude))
-                next_bme_poll = time.monotonic() + BME680_POLL_INTERVAL_S
+                if bme.enabled:
+                    temperature, humidity, pressure, altitude, ok = bme.read_once()
+                    if ok:
+                        bme_samples.append(
+                            (temperature, humidity, pressure, altitude)
+                        )
+                next_bme_poll = time.monotonic() + BME280_POLL_INTERVAL_S
 
             now = time.monotonic()
             if now >= next_data_log:
-                write_data_block(list(dht_samples), list(bme_samples), camera)
-                dht_samples.clear()
+                write_data_block(dht_samples, list(bme_samples), camera)
+                for samples in dht_samples.values():
+                    samples.clear()
                 bme_samples.clear()
-                next_data_log = time.monotonic() + DATA_LOG_INTERVAL_S
+                next_data_log = time.monotonic() + data_interval
+
+            now = time.monotonic()
+            if now >= next_image_capture:
+                enforce_image_disk_reserve()
+                image_path = camera.capture()
+                if image_path is None:
+                    log("Scheduled image capture produced no image", "WARNING")
+                else:
+                    log(f"Queued image for store-and-forward: {image_path}")
+                enforce_image_disk_reserve()
+                next_image_capture = time.monotonic() + image_interval
 
             now = time.monotonic()
             if now >= next_upload:
                 try:
-                    last_upload_status = send_data(camera)
+                    last_upload_status = send_data()
                 except Exception as exc:
                     # send_data is already defensive, but the scheduler itself
                     # is the final containment boundary.
                     log(f"Unhandled transfer-phase error: {exc}", "ERROR")
                     last_upload_status = (False, False)
-                next_upload = time.monotonic() + UPLOAD_INTERVAL_S
+
+                if all(last_upload_status):
+                    was_offline = connectivity_state.get("offline_since_epoch")
+                    connectivity_state = {
+                        "offline_since_epoch": None,
+                        "last_success_epoch": time.time(),
+                    }
+                    if was_offline is not None:
+                        log("Connectivity restored; beginning bounded backlog drain")
+                    next_upload_interval = UPLOAD_INTERVAL_S
+                else:
+                    if connectivity_state.get("offline_since_epoch") is None:
+                        connectivity_state["offline_since_epoch"] = time.time()
+                        log(
+                            "Connectivity failure confirmed; entering adaptive "
+                            "offline recording mode",
+                            "WARNING",
+                        )
+                    next_upload_interval = probe_interval
+                save_connectivity_state(connectivity_state)
+
+                # A successful copy permits the shorter normal resend window.
+                # Compact each stream independently: one successful SCP must
+                # never authorize trimming the other stream.
+                if last_upload_status[0]:
+                    compact_csv_to_recent_rows(
+                        LOCAL_WEATHER_CSV,
+                        WEATHER_HEADER,
+                        LOCAL_CSV_RETAIN_AFTER_UPLOAD_DAYS,
+                        "confirmed weather upload",
+                    )
+                if last_upload_status[1]:
+                    compact_csv_to_recent_rows(
+                        LOCAL_SYSTEM_CSV,
+                        SYSTEM_HEADER,
+                        LOCAL_CSV_RETAIN_AFTER_UPLOAD_DAYS,
+                        "confirmed system upload",
+                    )
+                next_upload = time.monotonic() + next_upload_interval
 
             now = time.monotonic()
-            if next_clear is not None and now >= next_clear:
-                clear_uploaded_csvs(*last_upload_status)
-                # A success is consumed by the clear operation.  A later clear
-                # must require a new confirmed upload, not a stale success flag.
-                last_upload_status = (False, False)
-                next_clear = time.monotonic() + LOCAL_CSV_CLEAR_INTERVAL_S
+            if now >= next_retention_check:
+                # At the long-term hourly cadence this ceiling represents more
+                # than 28 years of measurements, while still making growth
+                # mathematically finite if configuration changes unexpectedly.
+                compact_csv_to_max_rows(
+                    LOCAL_WEATHER_CSV,
+                    WEATHER_HEADER,
+                    LOCAL_CSV_ABSOLUTE_MAX_ROWS,
+                    "absolute offline safety ceiling",
+                )
+                compact_csv_to_max_rows(
+                    LOCAL_SYSTEM_CSV,
+                    SYSTEM_HEADER,
+                    LOCAL_CSV_ABSOLUTE_MAX_ROWS,
+                    "absolute offline safety ceiling",
+                )
+                enforce_image_disk_reserve()
+                next_retention_check = (
+                    time.monotonic() + LOCAL_CSV_RETENTION_CHECK_INTERVAL_S
+                )
 
             # Keep the control loop responsive without busy-spinning.  All real
             # sensor cadence is governed by monotonic deadlines above.
@@ -1645,7 +2658,8 @@ def main():
         log(f"Fatal scheduler error: {exc}", "ERROR")
         raise
     finally:
-        dht.close()
+        for reader in dht_readers:
+            reader.close()
         bme.close()
         camera.close()
         log("Weather station shutdown complete")
